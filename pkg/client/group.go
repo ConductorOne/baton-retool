@@ -86,11 +86,11 @@ func (g *GroupMember) GetGroupID() int64 {
 
 func (c *Client) GetGroupPage(ctx context.Context, groupID int64, pageID int64) (*GroupPage, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting group page", zap.Int64("group_id", groupID), zap.Int64("page_id", pageID))
+	l.Debug("getting group page", zap.Int64("group_id", groupID), zap.Int64("page_id", pageID))
 
 	args := []interface{}{groupID, pageID}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "accessLevel" from group_pages WHERE "groupId"=$1 AND "pageId"=$2`)
+	_, _ = sb.WriteString(`select "id", "accessLevel" from group_pages WHERE "groupId"=$1 AND "pageId"=$2`)
 
 	var ret GroupPage
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -103,11 +103,11 @@ func (c *Client) GetGroupPage(ctx context.Context, groupID int64, pageID int64) 
 
 func (c *Client) GetGroupFolderDefault(ctx context.Context, groupID int64, folderID int64) (*GroupFolderDefault, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting group folder default", zap.Int64("group_id", groupID), zap.Int64("folder_id", folderID))
+	l.Debug("getting group folder default", zap.Int64("group_id", groupID), zap.Int64("folder_id", folderID))
 
 	args := []interface{}{groupID, folderID}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "accessLevel" from group_folder_defaults WHERE "groupId"=$1 AND "folderId"=$2`)
+	_, _ = sb.WriteString(`select "id", "accessLevel" from group_folder_defaults WHERE "groupId"=$1 AND "folderId"=$2`)
 
 	var ret GroupFolderDefault
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -120,11 +120,11 @@ func (c *Client) GetGroupFolderDefault(ctx context.Context, groupID int64, folde
 
 func (c *Client) GetGroupResource(ctx context.Context, groupID int64, resourceID int64) (*GroupResource, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting group resource", zap.Int64("group_id", groupID), zap.Int64("resource_id", resourceID))
+	l.Debug("getting group resource", zap.Int64("group_id", groupID), zap.Int64("resource_id", resourceID))
 
 	args := []interface{}{groupID, resourceID}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "accessLevel" from group_resources WHERE "groupId"=$1 AND "resourceId"=$2`)
+	_, _ = sb.WriteString(`select "id", "accessLevel" from group_resources WHERE "groupId"=$1 AND "resourceId"=$2`)
 
 	var ret GroupResource
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -137,11 +137,11 @@ func (c *Client) GetGroupResource(ctx context.Context, groupID int64, resourceID
 
 func (c *Client) GetGroupResourceFolderDefault(ctx context.Context, groupID int64, folderID int64) (*GroupResourceFolderDefault, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting group resource folder default", zap.Int64("group_id", groupID), zap.Int64("folder_id", folderID))
+	l.Debug("getting group resource folder default", zap.Int64("group_id", groupID), zap.Int64("folder_id", folderID))
 
 	args := []interface{}{groupID, folderID}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "accessLevel" from group_resource_folder_defaults WHERE "groupId"=$1 AND "resourceFolderId"=$2`)
+	_, _ = sb.WriteString(`select "id", "accessLevel" from group_resource_folder_defaults WHERE "groupId"=$1 AND "resourceFolderId"=$2`)
 
 	var ret GroupResourceFolderDefault
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -154,7 +154,7 @@ func (c *Client) GetGroupResourceFolderDefault(ctx context.Context, groupID int6
 
 func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pager) ([]*GroupMember, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing group members for group", zap.Int64("group_id", groupID))
+	l.Debug("listing group members for group", zap.Int64("group_id", groupID))
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -165,14 +165,14 @@ func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pag
 	args = append(args, groupID)
 
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 `)
+	_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 `)
 
 	args = append(args, limit+1)
-	sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
+	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
 
 	if offset > 0 {
 		args = append(args, offset)
-		sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
+		_, _ = sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
 	}
 
 	var ret []*GroupMember
@@ -196,11 +196,11 @@ func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pag
 
 func (c *Client) GetGroup(ctx context.Context, groupID int64) (*GroupModel, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting group", zap.Int64("group_id", groupID))
+	l.Debug("getting group", zap.Int64("group_id", groupID))
 
 	args := []interface{}{groupID}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "organizationId", "universalAccess", "universalResourceAccess",
+	_, _ = sb.WriteString(`select "id", "name", "organizationId", "universalAccess", "universalResourceAccess",
        						  "universalQueryLibraryAccess", "userListAccess", "auditLogAccess", "unpublishedReleaseAccess"
 							  from groups WHERE "id"=$1`)
 
@@ -215,7 +215,7 @@ func (c *Client) GetGroup(ctx context.Context, groupID int64) (*GroupModel, erro
 
 func (c *Client) ListGroupsForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*GroupModel, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing groups for org", zap.Int64("org_id", orgID))
+	l.Debug("listing groups for org", zap.Int64("org_id", orgID))
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -224,23 +224,23 @@ func (c *Client) ListGroupsForOrg(ctx context.Context, orgID int64, pager *Pager
 	var args []interface{}
 
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "organizationId", "universalAccess", "universalResourceAccess",
+	_, _ = sb.WriteString(`select "id", "name", "organizationId", "universalAccess", "universalResourceAccess",
        						  "universalQueryLibraryAccess", "userListAccess", "auditLogAccess", "unpublishedReleaseAccess"
 							  from groups `)
 
 	if orgID != 0 {
 		args = append(args, orgID)
-		sb.WriteString(fmt.Sprintf(`WHERE "organizationId"=$%d `, len(args)))
+		_, _ = sb.WriteString(fmt.Sprintf(`WHERE "organizationId"=$%d `, len(args)))
 	} else {
-		sb.WriteString(`WHERE "organizationId" IS NULL `)
+		_, _ = sb.WriteString(`WHERE "organizationId" IS NULL `)
 	}
 
 	args = append(args, limit+1)
-	sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
+	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
 
 	if offset > 0 {
 		args = append(args, offset)
-		sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
+		_, _ = sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
 	}
 
 	var ret []*GroupModel

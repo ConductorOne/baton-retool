@@ -67,7 +67,7 @@ func (u *UserModel) GetLastLoggedIn() time.Time {
 
 func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*UserModel, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing users for org", zap.Int64("org_id", orgID))
+	l.Debug("listing users for org", zap.Int64("org_id", orgID))
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -76,12 +76,12 @@ func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager)
 	var args []interface{}
 
 	sb := &strings.Builder{}
-	sb.WriteString(`SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" from users WHERE "organizationId"=$1 `)
+	_, _ = sb.WriteString(`SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" from users WHERE "organizationId"=$1 `)
 	args = append(args, orgID)
-	sb.WriteString("LIMIT $2 ")
+	_, _ = sb.WriteString("LIMIT $2 ")
 	args = append(args, limit+1)
 	if offset > 0 {
-		sb.WriteString("OFFSET $3")
+		_, _ = sb.WriteString("OFFSET $3")
 		args = append(args, offset)
 	}
 
