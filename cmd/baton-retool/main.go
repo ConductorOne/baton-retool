@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/conductorone/baton-retool/pkg/connector"
 	"github.com/conductorone/baton-sdk/pkg/cli"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/sdk"
 	"github.com/conductorone/baton-sdk/pkg/types"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
@@ -26,6 +28,12 @@ func main() {
 
 	cmd.Version = version
 
+	cmd.PersistentFlags().String(
+		"connection-string",
+		"user=retool password=retool host=localhost port=5432 dbname=hammerhead_production",
+		"The connection string for connecting to retool database",
+	)
+
 	err = cmd.Execute()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -36,22 +44,27 @@ func main() {
 func getConnector(ctx context.Context, cfg *config) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	c, err := sdk.NewEmptyConnector()
+	cb, err := connector.New(ctx, cfg.ConnectionString)
 	if err != nil {
-		l.Error("error creating connector", zap.Error(err))
+		l.Error("error creating connector builder", zap.Error(err))
+		return nil, err
+	}
+
+	c, err := connectorbuilder.NewConnector(ctx, cb)
+	if err != nil {
+		l.Error("error creating connector from connector builder", zap.Error(err))
 		return nil, err
 	}
 
 	return c, nil
 }
 
-// run is where the process of syncing with the connector is implemented.
+// run is where the the process of syncing with the connector is implemented.
 func run(ctx context.Context, cfg *config) error {
 	l := ctxzap.Extract(ctx)
 
 	c, err := getConnector(ctx, cfg)
 	if err != nil {
-		l.Error("error creating connector", zap.Error(err))
 		return err
 	}
 

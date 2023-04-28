@@ -2,39 +2,59 @@ package connector
 
 import (
 	"context"
-	"fmt"
+	"io"
 
+	"github.com/conductorone/baton-retool/pkg/client"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
-// TODO: implement your connector here
-type connectorImpl struct {
+var titleCaser = cases.Title(language.English)
+
+type ConnectorImpl struct {
+	client *client.Client
 }
 
-func (c *connectorImpl) ListResourceTypes(ctx context.Context, req *v2.ResourceTypesServiceListResourceTypesRequest) (*v2.ResourceTypesServiceListResourceTypesResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
+	return &v2.ConnectorMetadata{
+		DisplayName: "retool",
+	}, nil
 }
 
-func (c *connectorImpl) ListResources(ctx context.Context, req *v2.ResourcesServiceListResourcesRequest) (*v2.ResourcesServiceListResourcesResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+func (c *ConnectorImpl) Validate(ctx context.Context) (annotations.Annotations, error) {
+	err := c.client.ValidateConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
-func (c *connectorImpl) ListEntitlements(ctx context.Context, req *v2.EntitlementsServiceListEntitlementsRequest) (*v2.EntitlementsServiceListEntitlementsResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+func (c *ConnectorImpl) Asset(ctx context.Context, asset *v2.AssetRef) (string, io.ReadCloser, error) {
+	return "", nil, nil
 }
 
-func (c *connectorImpl) ListGrants(ctx context.Context, req *v2.GrantsServiceListGrantsRequest) (*v2.GrantsServiceListGrantsResponse, error) {
-	return nil, fmt.Errorf("not implemented")
+func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
+	syncers := []connectorbuilder.ResourceSyncer{
+		newOrgSyncer(ctx, c.client),
+		newUserSyncer(ctx, c.client),
+		newGroupSyncer(ctx, c.client),
+		newPageSyncer(ctx, c.client),
+		newResourceSyncer(ctx, c.client),
+	}
+
+	return syncers
 }
 
-func (c *connectorImpl) GetMetadata(ctx context.Context, req *v2.ConnectorServiceGetMetadataRequest) (*v2.ConnectorServiceGetMetadataResponse, error) {
-	return nil, fmt.Errorf("not implemented")
-}
+func New(ctx context.Context, dsn string) (*ConnectorImpl, error) {
+	c, err := client.New(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
 
-func (c *connectorImpl) Validate(ctx context.Context, req *v2.ConnectorServiceValidateRequest) (*v2.ConnectorServiceValidateResponse, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-
-func (c *connectorImpl) GetAsset(req *v2.AssetServiceGetAssetRequest, server v2.AssetService_GetAssetServer) error {
-	return fmt.Errorf("not implemented")
+	return &ConnectorImpl{
+		client: c,
+	}, nil
 }
