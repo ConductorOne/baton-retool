@@ -14,6 +14,8 @@ linters-settings:
     disable:
       - fieldalignment # too strict
       - shadow # complains too much about shadowing errors. All research points to this being fine.
+      - deadcode
+      - varcheck
 
   nakedret:
     max-func-lines: 0
@@ -44,7 +46,6 @@ linters-settings:
           - hasher.Write
           - os.Setenv
           - os.RemoveAll
-          - sb.WriteString
       - name: var-naming
         arguments: [["ID", "URL", "HTTP", "API"], []]
 

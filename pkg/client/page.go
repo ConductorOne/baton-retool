@@ -48,11 +48,11 @@ func (g *PageModel) GetOrgID() int64 {
 
 func (c *Client) GetPage(ctx context.Context, id int64) (*PageModel, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting page", zap.Int64("page_id", id))
+	l.Debug("getting page", zap.Int64("page_id", id))
 
 	args := []interface{}{id}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "organizationId", "folderId", "photoUrl", "description" from pages WHERE "deletedAt" IS NULL AND "id"=$1`)
+	_, _ = sb.WriteString(`select "id", "name", "organizationId", "folderId", "photoUrl", "description" from pages WHERE "deletedAt" IS NULL AND "id"=$1`)
 
 	var ret PageModel
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -65,7 +65,7 @@ func (c *Client) GetPage(ctx context.Context, id int64) (*PageModel, error) {
 
 func (c *Client) ListPagesForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*PageModel, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing groups for org", zap.Int64("org_id", orgID))
+	l.Debug("listing groups for org", zap.Int64("org_id", orgID))
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -74,21 +74,21 @@ func (c *Client) ListPagesForOrg(ctx context.Context, orgID int64, pager *Pager)
 	var args []interface{}
 
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "organizationId", "folderId", "photoUrl", "description" from pages WHERE "deletedAt" IS NULL `)
+	_, _ = sb.WriteString(`select "id", "name", "organizationId", "folderId", "photoUrl", "description" from pages WHERE "deletedAt" IS NULL `)
 
 	if orgID != 0 {
 		args = append(args, orgID)
-		sb.WriteString(fmt.Sprintf(`AND "organizationId"=$%d `, len(args)))
+		_, _ = sb.WriteString(fmt.Sprintf(`AND "organizationId"=$%d `, len(args)))
 	} else {
-		sb.WriteString(`AND "organizationId" IS NULL `)
+		_, _ = sb.WriteString(`AND "organizationId" IS NULL `)
 	}
 
 	args = append(args, limit+1)
-	sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
+	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
 
 	if offset > 0 {
 		args = append(args, offset)
-		sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
+		_, _ = sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
 	}
 
 	var ret []*PageModel

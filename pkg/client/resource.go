@@ -48,11 +48,11 @@ func (g *ResourceModel) GetResourceFolderID() int64 {
 
 func (c *Client) GetResource(ctx context.Context, id int64) (*ResourceModel, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("getting resource", zap.Int64("resource_id", id))
+	l.Debug("getting resource", zap.Int64("resource_id", id))
 
 	args := []interface{}{id}
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "type", "displayName", "environmentId", "resourceFolderId" from resources WHERE "id"=$1 `)
+	_, _ = sb.WriteString(`select "id", "name", "type", "displayName", "environmentId", "resourceFolderId" from resources WHERE "id"=$1 `)
 
 	var ret ResourceModel
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -65,7 +65,7 @@ func (c *Client) GetResource(ctx context.Context, id int64) (*ResourceModel, err
 
 func (c *Client) ListResourcesForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*ResourceModel, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing resources for org", zap.Int64("org_id", orgID))
+	l.Debug("listing resources for org", zap.Int64("org_id", orgID))
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -74,12 +74,12 @@ func (c *Client) ListResourcesForOrg(ctx context.Context, orgID int64, pager *Pa
 	var args []interface{}
 
 	sb := &strings.Builder{}
-	sb.WriteString(`select "id", "name", "type", "displayName", "environmentId", "resourceFolderId" from resources WHERE "organizationId"=$1 `)
+	_, _ = sb.WriteString(`select "id", "name", "type", "displayName", "environmentId", "resourceFolderId" from resources WHERE "organizationId"=$1 `)
 	args = append(args, orgID)
-	sb.WriteString("LIMIT $2 ")
+	_, _ = sb.WriteString("LIMIT $2 ")
 	args = append(args, limit+1)
 	if offset > 0 {
-		sb.WriteString("OFFSET $3")
+		_, _ = sb.WriteString("OFFSET $3")
 		args = append(args, offset)
 	}
 

@@ -17,7 +17,7 @@ type OrgModel struct {
 // select id, domain, name, hostname, subdomain from organizations;.
 func (c *Client) ListOrganizations(ctx context.Context, pager *Pager) ([]*OrgModel, string, error) {
 	l := ctxzap.Extract(ctx)
-	l.Info("listing organizations")
+	l.Debug("listing organizations")
 
 	offset, limit, err := pager.Parse()
 	if err != nil {
@@ -27,12 +27,12 @@ func (c *Client) ListOrganizations(ctx context.Context, pager *Pager) ([]*OrgMod
 
 	sb := &strings.Builder{}
 
-	sb.WriteString(`SELECT "id", "name" FROM organizations `)
+	_, _ = sb.WriteString(`SELECT "id", "name" FROM organizations `)
 
-	sb.WriteString("LIMIT $1 ")
+	_, _ = sb.WriteString("LIMIT $1 ")
 	args = append(args, limit+1)
 	if offset > 0 {
-		sb.WriteString("OFFSET $2")
+		_, _ = sb.WriteString("OFFSET $2")
 		args = append(args, offset)
 	}
 
