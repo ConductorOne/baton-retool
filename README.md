@@ -1,3 +1,102 @@
 # baton-retool
-Welcome to your new connector! To start out, you will want to update the dependencies.
-Do this by running `make update-deps`.
+`baton-retool` is a connector for [Retool](https://retool.com/) built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It connects directly to your primary Retool Postgres database and syncs data about users, groups, organizations, pages, and resources.
+
+Check out [Baton](https://github.com/conductorone/baton) to learn more the project in general.
+
+# Getting Started
+
+## Setup
+1. While connected to the Retool database, create a new user for the connector to connect to Postgres as. Be sure to create and save the secure password for this user:
+```postgresql
+CREATE USER conductorone WITH PASSWORD 'secure-password';
+```
+2. Grant your new role the privileges required by the connector for inspecting retool privileges.
+```postgresql
+GRANT SELECT ("id", "name", "organizationId", "universalAccess", "universalResourceAccess", "universalQueryLibraryAccess",
+              "userListAccess", "auditLogAccess", "unpublishedReleaseAccess") ON groups TO baton;
+GRANT SELECT ("id", "accessLevel") ON group_pages TO baton;
+GRANT SELECT ("id", "accessLevel") ON group_folder_defaults TO baton;
+GRANT SELECT ("id", "accessLevel") on group_resources TO baton;
+GRANT SELECT ("id", "accessLevel") on group_resource_folder_defaults TO baton;
+GRANT SELECT ("id", "name") ON organizations TO baton;
+GRANT SELECT ("id", "name", "organizationId", "folderId", "photoUrl", "description", "deletedAt") ON pages TO baton;
+GRANT SELECT ("id", "name", "organizationId", "type", "displayName", "environmentId", "resourceFolderId") ON resources TO baton;
+GRANT SELECT ("id", "email", "firstName", "lastName", "profilePhotoUrl", "userName", "enabled", "lastLoggedIn", "organizationId") ON users TO baton;
+GRANT SELECT ("id", "userId", "groupId", "isAdmin") ON user_groups TO baton;
+```
+
+3. Run the connector with the proper connection string. For example if you created a new `baton` user with the password `baton`, it may look like this:
+```bash
+BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" baton-retool
+```
+
+## brew
+
+```
+brew install conductorone/baton/baton conductorone/baton/baton-retool
+baton-retool
+baton resources
+```
+
+## docker
+
+```
+docker run --rm -v $(pwd):/out -e BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" ghcr.io/conductorone/baton-retool:latest -f "/out/sync.c1z"
+docker run --rm -v $(pwd):/out ghcr.io/conductorone/baton:latest -f "/out/sync.c1z" resources
+```
+
+## source
+
+```
+go install github.com/conductorone/baton/cmd/baton@main
+go install github.com/conductorone/baton-retool/cmd/baton-retool@main
+
+BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" baton-retool
+baton resources
+```
+
+# Data Model
+
+`baton-retool` pulls down information about the following Retool resources:
+- Users
+- Groups
+- Organizations
+- Pages
+- Resources
+
+# Contributing, Support, and Issues
+
+We started Baton because we were tired of taking screenshots and manually building spreadsheets. We welcome contributions, and ideas, no matter how small -- our goal is to make identity and permissions sprawl less painful for everyone. If you have questions, problems, or ideas: Please open a Github Issue!
+
+See [CONTRIBUTING.md](https://github.com/ConductorOne/baton/blob/main/CONTRIBUTING.md) for more details.
+
+# `baton-retool` Command Line Usage
+
+```
+baton-retool
+
+Usage:
+  baton-retool [flags]
+  baton-retool [command]
+
+Available Commands:
+  completion         Generate the autocompletion script for the specified shell
+  help               Help about any command
+
+Flags:
+      --client-id string              The client ID used to authenticate with ConductorOne ($BATON_CLIENT_ID)
+      --client-secret string          The client secret used to authenticate with ConductorOne ($BATON_CLIENT_SECRET)
+      --connection-string string      The connection string for connecting to retool database ($BATON_CONNECTION_STRING) (default "user=retool password=retool host=localhost port=5432 dbname=hammerhead_production")
+  -f, --file string                   The path to the c1z file to sync with ($BATON_FILE) (default "sync.c1z")
+      --grant-entitlement string      The entitlement to grant to the supplied principal ($BATON_GRANT_ENTITLEMENT)
+      --grant-principal string        The resource to grant the entitlement to ($BATON_GRANT_PRINCIPAL)
+      --grant-principal-type string   The resource type of the principal to grant the entitlement to ($BATON_GRANT_PRINCIPAL_TYPE)
+  -h, --help                          help for baton-retool
+      --log-format string             The output format for logs: json, console ($BATON_LOG_FORMAT) (default "json")
+      --log-level string              The log level: debug, info, warn, error ($BATON_LOG_LEVEL) (default "info")
+      --revoke-grant string           The grant to revoke ($BATON_REVOKE_GRANT)
+  -v, --version                       version for baton-retool
+
+Use "baton-retool [command] --help" for more information about a command.
+
+```
