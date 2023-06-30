@@ -30,7 +30,7 @@ func main() {
 	cmd.PersistentFlags().String(
 		"connection-string",
 		"user=retool password=retool host=localhost port=5432 dbname=hammerhead_production",
-		"The connection string for connecting to retool database",
+		"The connection string for connecting to retool database ($BATON_CONNECTION_STRING)",
 	)
 
 	err = cmd.Execute()
