@@ -78,7 +78,7 @@ func (s *orgSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pTo
 		ret = append(ret, &v2.Entitlement{
 			Resource:    resource,
 			Id:          fmt.Sprintf("entitlement:%s:universal:%s", resource.Id.Resource, level),
-			DisplayName: fmt.Sprintf("%s Universal %s Access", resource.DisplayName, titleCaser.String(accessLevelDisplayNames[level])),
+			DisplayName: fmt.Sprintf("%s Universal %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level])),
 			Description: fmt.Sprintf("Has universal %s access on the %s organization", accessLevelDisplayNames[level], resource.DisplayName),
 			GrantableTo: []*v2.ResourceType{resourceTypeUser},
 			Annotations: annos,
@@ -88,7 +88,7 @@ func (s *orgSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pTo
 		ret = append(ret, &v2.Entitlement{
 			Resource:    resource,
 			Id:          fmt.Sprintf("entitlement:%s:universalResource:%s", resource.Id.Resource, level),
-			DisplayName: fmt.Sprintf("%s Universal Resource %s Access", resource.DisplayName, titleCaser.String(accessLevelDisplayNames[level])),
+			DisplayName: fmt.Sprintf("%s Universal Resource %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level])),
 			Description: fmt.Sprintf("Has universal resource %s access on the %s organization", accessLevelDisplayNames[level], resource.DisplayName),
 			GrantableTo: []*v2.ResourceType{resourceTypeUser},
 			Annotations: annos,
@@ -98,7 +98,7 @@ func (s *orgSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pTo
 		ret = append(ret, &v2.Entitlement{
 			Resource:    resource,
 			Id:          fmt.Sprintf("entitlement:%s:universalQueryLibrary:%s", resource.Id.Resource, level),
-			DisplayName: fmt.Sprintf("%s Universal Query Library %s Access", resource.DisplayName, titleCaser.String(accessLevelDisplayNames[level])),
+			DisplayName: fmt.Sprintf("%s Universal Query Library %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level])),
 			Description: fmt.Sprintf("Has universal query library %s access on the %s organization", accessLevelDisplayNames[level], resource.DisplayName),
 			GrantableTo: []*v2.ResourceType{resourceTypeUser},
 			Annotations: annos,
