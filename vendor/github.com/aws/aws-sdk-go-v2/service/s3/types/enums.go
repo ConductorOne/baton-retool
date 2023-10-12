@@ -106,6 +106,8 @@ const (
 	BucketLocationConstraintUsGovWest1   BucketLocationConstraint = "us-gov-west-1"
 	BucketLocationConstraintUsWest1      BucketLocationConstraint = "us-west-1"
 	BucketLocationConstraintUsWest2      BucketLocationConstraint = "us-west-2"
+	BucketLocationConstraintApSouth2     BucketLocationConstraint = "ap-south-2"
+	BucketLocationConstraintEuSouth2     BucketLocationConstraint = "eu-south-2"
 )
 
 // Values returns all known values for BucketLocationConstraint. Note that this
@@ -139,6 +141,8 @@ func (BucketLocationConstraint) Values() []BucketLocationConstraint {
 		"us-gov-west-1",
 		"us-west-1",
 		"us-west-2",
+		"ap-south-2",
+		"eu-south-2",
 	}
 }
 
@@ -543,6 +547,8 @@ const (
 	InventoryOptionalFieldIntelligentTieringAccessTier InventoryOptionalField = "IntelligentTieringAccessTier"
 	InventoryOptionalFieldBucketKeyStatus              InventoryOptionalField = "BucketKeyStatus"
 	InventoryOptionalFieldChecksumAlgorithm            InventoryOptionalField = "ChecksumAlgorithm"
+	InventoryOptionalFieldObjectAccessControlList      InventoryOptionalField = "ObjectAccessControlList"
+	InventoryOptionalFieldObjectOwner                  InventoryOptionalField = "ObjectOwner"
 )
 
 // Values returns all known values for InventoryOptionalField. Note that this can
@@ -563,6 +569,8 @@ func (InventoryOptionalField) Values() []InventoryOptionalField {
 		"IntelligentTieringAccessTier",
 		"BucketKeyStatus",
 		"ChecksumAlgorithm",
+		"ObjectAccessControlList",
+		"ObjectOwner",
 	}
 }
 
@@ -998,10 +1006,11 @@ type ReplicationStatus string
 
 // Enum values for ReplicationStatus
 const (
-	ReplicationStatusComplete ReplicationStatus = "COMPLETE"
-	ReplicationStatusPending  ReplicationStatus = "PENDING"
-	ReplicationStatusFailed   ReplicationStatus = "FAILED"
-	ReplicationStatusReplica  ReplicationStatus = "REPLICA"
+	ReplicationStatusComplete  ReplicationStatus = "COMPLETE"
+	ReplicationStatusPending   ReplicationStatus = "PENDING"
+	ReplicationStatusFailed    ReplicationStatus = "FAILED"
+	ReplicationStatusReplica   ReplicationStatus = "REPLICA"
+	ReplicationStatusCompleted ReplicationStatus = "COMPLETED"
 )
 
 // Values returns all known values for ReplicationStatus. Note that this can be
@@ -1013,6 +1022,7 @@ func (ReplicationStatus) Values() []ReplicationStatus {
 		"PENDING",
 		"FAILED",
 		"REPLICA",
+		"COMPLETED",
 	}
 }
 
