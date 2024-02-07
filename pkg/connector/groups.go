@@ -210,6 +210,39 @@ func (o *groupSyncer) Grant(ctx context.Context, principial *v2.Resource, entitl
 }
 
 func (o *groupSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.Annotations, error) {
+	l := ctxzap.Extract(ctx)
+
+	entitlement := grant.Entitlement
+	principial := grant.Principal
+
+	if principial.Id.ResourceType != resourceTypeUser.Id {
+		l.Warn(
+			"only users can be added to the group",
+			zap.String("principal_id", principial.Id.Resource),
+			zap.String("principal_type", principial.Id.ResourceType),
+		)
+	}
+
+	groupID, err := parseObjectID(entitlement.Resource.Id.Resource)
+	if err != nil {
+		return nil, err
+	}
+	userID, err := parseObjectID(principial.Id.Resource)
+	if err != nil {
+		return nil, err
+	}
+
+	err = o.client.RemoveGroupMember(ctx, groupID, userID)
+	if err != nil {
+		l.Error(
+			err.Error(),
+			zap.String("principal_id", principial.Id.Resource),
+			zap.String("principal_type", principial.Id.ResourceType),
+		)
+
+		return nil, err
+	}
+
 	return nil, nil
 }
 

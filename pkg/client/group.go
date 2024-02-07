@@ -331,3 +331,21 @@ func (c *Client) UpdateGroupMember(ctx context.Context, groupID, userID int64, i
 
 	return c.GetGroupMember(ctx, groupID, userID)
 }
+
+func (c *Client) RemoveGroupMember(ctx context.Context, groupID, userID int64) error {
+	l := ctxzap.Extract(ctx)
+	l.Debug("remove user from group", zap.Int64("user_id", userID))
+
+	args := []interface{}{groupID, userID}
+	sb := &strings.Builder{}
+	_, err := sb.WriteString(`DELETE FROM user_groups WHERE "groupId"=$1 AND "userId"=$2`)
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+		return err
+	}
+
+	return nil
+}
