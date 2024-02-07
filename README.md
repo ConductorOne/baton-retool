@@ -22,7 +22,8 @@ GRANT SELECT ("id", "name") ON organizations TO baton;
 GRANT SELECT ("id", "name", "organizationId", "folderId", "photoUrl", "description", "deletedAt") ON pages TO baton;
 GRANT SELECT ("id", "name", "organizationId", "type", "displayName", "environmentId", "resourceFolderId") ON resources TO baton;
 GRANT SELECT ("id", "email", "firstName", "lastName", "profilePhotoUrl", "userName", "enabled", "lastLoggedIn", "organizationId") ON users TO baton;
-GRANT SELECT, INSERT, UPDATE ("id", "userId", "groupId", "isAdmin") ON user_groups TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "userId", "groupId", "isAdmin", "updatedAt") ON user_groups TO baton;
+GRANT USAGE, SELECT ON SEQUENCE user_groups_id_seq TO baton;
 ```
 
 3. Run the connector with the proper connection string. For example if you created a new `baton` user with the password `baton`, it may look like this:
