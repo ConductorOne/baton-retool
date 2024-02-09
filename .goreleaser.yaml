@@ -65,7 +65,7 @@ checksum:
     - glob: ./dist/*-darwin-amd64.zip
     - glob: ./dist/*-darwin-arm64.zip
 brews:
-  - tap:
+  - repository:
       owner: conductorone
       name: homebrew-baton
     folder: Formula
