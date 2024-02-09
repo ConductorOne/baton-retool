@@ -20,6 +20,8 @@ func (p *Pager) Parse() (int, int, error) {
 	var offset int
 	var err error
 	switch {
+	case p.Size == 0:
+		parsedPageSize = MaxPageSize
 	case p.Size <= MinPageSize:
 		parsedPageSize = MinPageSize
 
