@@ -7,7 +7,6 @@ import (
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 
 	"github.com/conductorone/baton-retool/pkg/client"
@@ -16,7 +15,6 @@ import (
 var resourceTypePage = &v2.ResourceType{
 	Id:          "page",
 	DisplayName: "Page",
-	Traits:      []v2.ResourceType_Trait{v2.ResourceType_TRAIT_APP},
 }
 
 type pageSyncer struct {
@@ -49,21 +47,6 @@ func (s *pageSyncer) List(
 
 	var ret []*v2.Resource
 	for _, o := range pages {
-		var annos annotations.Annotations
-
-		p := make(map[string]interface{})
-
-		if o.OrganizationID != nil {
-			p["organization_id"] = o.GetOrgID()
-		}
-
-		gt, err := resources.NewAppTrait(resources.WithAppProfile(p))
-		if err != nil {
-			return nil, "", nil, err
-		}
-
-		annos.Append(gt)
-
 		ret = append(ret, &v2.Resource{
 			DisplayName: o.Name,
 			Id: &v2.ResourceId{
@@ -71,7 +54,6 @@ func (s *pageSyncer) List(
 				Resource:     formatObjectID(s.resourceType.Id, o.ID),
 			},
 			ParentResourceId: parentResourceID,
-			Annotations:      annos,
 		})
 	}
 

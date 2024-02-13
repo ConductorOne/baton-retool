@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/conductorone/baton-retool/pkg/client"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	_ "github.com/georgysavva/scany/pgxscan"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+
+	"github.com/conductorone/baton-retool/pkg/client"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 )
@@ -19,8 +20,10 @@ var resourceTypeOrg = &v2.ResourceType{
 }
 
 type orgSyncer struct {
-	resourceType *v2.ResourceType
-	client       *client.Client
+	resourceType  *v2.ResourceType
+	client        *client.Client
+	skipPages     bool
+	skipResources bool
 }
 
 func (s *orgSyncer) ResourceType(ctx context.Context) *v2.ResourceType {
@@ -41,8 +44,12 @@ func (s *orgSyncer) List(
 
 	annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypeUser.Id})
 	annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypeGroup.Id})
-	annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypePage.Id})
-	annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypeResource.Id})
+	if !s.skipPages {
+		annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypePage.Id})
+	}
+	if !s.skipResources {
+		annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypeResource.Id})
+	}
 
 	var ret []*v2.Resource
 	for _, o := range orgs {
@@ -274,9 +281,11 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 	return ret, nextPageToken, nil, nil
 }
 
-func newOrgSyncer(ctx context.Context, c *client.Client) *orgSyncer {
+func newOrgSyncer(ctx context.Context, c *client.Client, skipPages bool, skipResources bool) *orgSyncer {
 	return &orgSyncer{
-		resourceType: resourceTypeOrg,
-		client:       c,
+		resourceType:  resourceTypeOrg,
+		client:        c,
+		skipPages:     skipPages,
+		skipResources: skipResources,
 	}
 }
