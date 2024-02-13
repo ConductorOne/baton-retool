@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/conductorone/baton-retool/pkg/connector"
 	"github.com/conductorone/baton-sdk/pkg/cli"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/types"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
+
+	"github.com/conductorone/baton-retool/pkg/connector"
 )
 
 var version = "dev"
@@ -33,6 +34,9 @@ func main() {
 		"The connection string for connecting to retool database ($BATON_CONNECTION_STRING)",
 	)
 
+	cmd.PersistentFlags().Bool("skip-pages", false, "Skip syncing pages")
+	cmd.PersistentFlags().Bool("skip-resources", false, "Skip syncing resources")
+
 	err = cmd.Execute()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
@@ -43,7 +47,7 @@ func main() {
 func getConnector(ctx context.Context, cfg *config) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	cb, err := connector.New(ctx, cfg.ConnectionString)
+	cb, err := connector.New(ctx, cfg.ConnectionString, cfg.SkipPages, cfg.SkipResources)
 	if err != nil {
 		l.Error("error creating connector builder", zap.Error(err))
 		return nil, err

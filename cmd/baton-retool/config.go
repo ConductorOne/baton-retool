@@ -12,6 +12,8 @@ type config struct {
 	cli.BaseConfig `mapstructure:",squash"` // Puts the base config options in the same place as the connector options
 
 	ConnectionString string `mapstructure:"connection-string"`
+	SkipPages        bool   `mapstructure:"skip-pages"`
+	SkipResources    bool   `mapstructure:"skip-resources"`
 }
 
 // validateConfig is run after the configuration is loaded, and should return an error if it isn't valid.

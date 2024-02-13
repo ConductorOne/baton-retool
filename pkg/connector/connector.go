@@ -4,12 +4,13 @@ import (
 	"context"
 	"io"
 
-	"github.com/conductorone/baton-retool/pkg/client"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
+
+	"github.com/conductorone/baton-retool/pkg/client"
 )
 
 func titleCase(s string) string {
@@ -19,12 +20,15 @@ func titleCase(s string) string {
 }
 
 type ConnectorImpl struct {
-	client *client.Client
+	client        *client.Client
+	skipPages     bool
+	skipResources bool
 }
 
 func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
 	return &v2.ConnectorMetadata{
 		DisplayName: "retool",
+		Description: "Retool connector",
 	}, nil
 }
 
@@ -42,23 +46,31 @@ func (c *ConnectorImpl) Asset(ctx context.Context, asset *v2.AssetRef) (string, 
 
 func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
 	syncers := []connectorbuilder.ResourceSyncer{
-		newOrgSyncer(ctx, c.client),
+		newOrgSyncer(ctx, c.client, c.skipPages, c.skipResources),
 		newUserSyncer(ctx, c.client),
 		newGroupSyncer(ctx, c.client),
-		newPageSyncer(ctx, c.client),
-		newResourceSyncer(ctx, c.client),
+	}
+
+	if !c.skipPages {
+		syncers = append(syncers, newPageSyncer(ctx, c.client))
+	}
+
+	if !c.skipResources {
+		syncers = append(syncers, newResourceSyncer(ctx, c.client))
 	}
 
 	return syncers
 }
 
-func New(ctx context.Context, dsn string) (*ConnectorImpl, error) {
+func New(ctx context.Context, dsn string, skipPages bool, skipResources bool) (*ConnectorImpl, error) {
 	c, err := client.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ConnectorImpl{
-		client: c,
+		client:        c,
+		skipPages:     skipPages,
+		skipResources: skipResources,
 	}, nil
 }
