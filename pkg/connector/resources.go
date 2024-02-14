@@ -176,15 +176,15 @@ func (s *resourceSyncer) Grants(ctx context.Context, resource *v2.Resource, pTok
 			return nil, "", nil, err
 		}
 
+		levels, err := s.resourceAccessLevelsForGroup(ctx, obj, group)
+		if err != nil {
+			return nil, "", nil, err
+		}
+
 		for _, m := range members {
 			if m.GetUserID() == 0 {
 				l.Debug("member did not have user ID defined -- skipping")
 				continue
-			}
-
-			levels, err := s.resourceAccessLevelsForGroup(ctx, obj, group)
-			if err != nil {
-				return nil, "", nil, err
 			}
 
 			principalID := &v2.ResourceId{
