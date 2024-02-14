@@ -76,6 +76,7 @@ func (c *Client) ListResourcesForOrg(ctx context.Context, orgID int64, pager *Pa
 	sb := &strings.Builder{}
 	_, _ = sb.WriteString(`select "id", "name", "type", "displayName", "environmentId", "resourceFolderId" from resources WHERE "organizationId"=$1 `)
 	args = append(args, orgID)
+	_, _ = sb.WriteString(`ORDER BY "id" `)
 	_, _ = sb.WriteString("LIMIT $2 ")
 	args = append(args, limit+1)
 	if offset > 0 {

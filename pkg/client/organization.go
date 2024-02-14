@@ -27,7 +27,7 @@ func (c *Client) ListOrganizations(ctx context.Context, pager *Pager) ([]*OrgMod
 
 	sb := &strings.Builder{}
 
-	_, _ = sb.WriteString(`SELECT "id", "name" FROM organizations `)
+	_, _ = sb.WriteString(`SELECT "id", "name" FROM organizations ORDER BY "id"`)
 
 	_, _ = sb.WriteString("LIMIT $1 ")
 	args = append(args, limit+1)

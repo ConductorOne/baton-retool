@@ -78,6 +78,7 @@ func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager)
 	sb := &strings.Builder{}
 	_, _ = sb.WriteString(`SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" from users WHERE "organizationId"=$1 `)
 	args = append(args, orgID)
+	_, _ = sb.WriteString(`ORDER BY "id" `)
 	_, _ = sb.WriteString("LIMIT $2 ")
 	args = append(args, limit+1)
 	if offset > 0 {
