@@ -173,15 +173,15 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 			return nil, "", nil, err
 		}
 
+		pageAccessLevels, err := s.pageAccessLevelsForGroup(ctx, page, group)
+		if err != nil {
+			return nil, "", nil, err
+		}
+
 		for _, m := range members {
 			if m.GetUserID() == 0 {
 				l.Debug("member did not have user ID defined -- skipping")
 				continue
-			}
-
-			pageAccessLevels, err := s.pageAccessLevelsForGroup(ctx, page, group)
-			if err != nil {
-				return nil, "", nil, err
 			}
 
 			principalID := &v2.ResourceId{
