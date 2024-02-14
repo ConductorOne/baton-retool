@@ -83,6 +83,8 @@ func (c *Client) ListPagesForOrg(ctx context.Context, orgID int64, pager *Pager)
 		_, _ = sb.WriteString(`AND "organizationId" IS NULL `)
 	}
 
+	_, _ = sb.WriteString(`ORDER BY "id" `)
+
 	args = append(args, limit+1)
 	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
 

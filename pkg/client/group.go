@@ -124,7 +124,7 @@ func (c *Client) GetGroupResource(ctx context.Context, groupID int64, resourceID
 
 	args := []interface{}{groupID, resourceID}
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`select "id", "accessLevel" from group_resources WHERE "groupId"=$1 AND "resourceId"=$2`)
+	_, _ = sb.WriteString(`SELECT "id", "accessLevel" from group_resources WHERE "groupId"=$1 AND "resourceId"=$2`)
 
 	var ret GroupResource
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -141,7 +141,7 @@ func (c *Client) GetGroupResourceFolderDefault(ctx context.Context, groupID int6
 
 	args := []interface{}{groupID, folderID}
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`select "id", "accessLevel" from group_resource_folder_defaults WHERE "groupId"=$1 AND "resourceFolderId"=$2`)
+	_, _ = sb.WriteString(`SELECT "id", "accessLevel" from group_resource_folder_defaults WHERE "groupId"=$1 AND "resourceFolderId"=$2`)
 
 	var ret GroupResourceFolderDefault
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
@@ -165,7 +165,7 @@ func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pag
 	args = append(args, groupID)
 
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 `)
+	_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 ORDER BY "id" `)
 
 	args = append(args, limit+1)
 	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
@@ -234,6 +234,8 @@ func (c *Client) ListGroupsForOrg(ctx context.Context, orgID int64, pager *Pager
 	} else {
 		_, _ = sb.WriteString(`WHERE "organizationId" IS NULL `)
 	}
+
+	_, _ = sb.WriteString(`ORDER BY "id" `)
 
 	args = append(args, limit+1)
 	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
