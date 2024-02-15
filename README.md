@@ -8,21 +8,23 @@ Check out [Baton](https://github.com/conductorone/baton) to learn more the proje
 ## Setup
 1. While connected to the Retool database, create a new user for the connector to connect to Postgres as. Be sure to create and save the secure password for this user:
 ```postgresql
-CREATE USER conductorone WITH PASSWORD 'secure-password';
+CREATE USER baton WITH PASSWORD 'secure-password';
 ```
 2. Grant your new role the privileges required by the connector for inspecting retool privileges.
 ```postgresql
 GRANT SELECT ("id", "name", "organizationId", "universalAccess", "universalResourceAccess", "universalQueryLibraryAccess",
               "userListAccess", "auditLogAccess", "unpublishedReleaseAccess") ON groups TO baton;
-GRANT SELECT ("id", "accessLevel") ON group_pages TO baton;
-GRANT SELECT ("id", "accessLevel") ON group_folder_defaults TO baton;
-GRANT SELECT ("id", "accessLevel") on group_resources TO baton;
-GRANT SELECT ("id", "accessLevel") on group_resource_folder_defaults TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") ON group_pages TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") ON group_folder_defaults TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") on group_resources TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") on group_resource_folder_defaults TO baton;
 GRANT SELECT ("id", "name") ON organizations TO baton;
 GRANT SELECT ("id", "name", "organizationId", "folderId", "photoUrl", "description", "deletedAt") ON pages TO baton;
 GRANT SELECT ("id", "name", "organizationId", "type", "displayName", "environmentId", "resourceFolderId") ON resources TO baton;
 GRANT SELECT ("id", "email", "firstName", "lastName", "profilePhotoUrl", "userName", "enabled", "lastLoggedIn", "organizationId") ON users TO baton;
-GRANT SELECT ("id", "userId", "groupId", "isAdmin") ON user_groups TO baton;
+GRANT SELECT, INSERT, UPDATE, DELETE ("id", "userId", "groupId", "isAdmin", "updatedAt") ON user_groups TO baton;
+GRANT USAGE, SELECT ON SEQUENCE user_groups_id_seq TO baton;
+GRANT DELETE ON user_groups TO baton;
 ```
 
 3. Run the connector with the proper connection string. For example if you created a new `baton` user with the password `baton`, it may look like this:

@@ -263,3 +263,91 @@ func (c *Client) ListGroupsForOrg(ctx context.Context, orgID int64, pager *Pager
 
 	return ret, nextPageToken, nil
 }
+
+func (c *Client) GetGroupMember(ctx context.Context, groupID, userID int64) (*GroupMember, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("getting group member", zap.Int64("group_id", groupID), zap.Int64("user_id", userID))
+
+	var args []interface{}
+	args = append(args, groupID)
+	args = append(args, userID)
+
+	sb := &strings.Builder{}
+	_, err := sb.WriteString(`SELECT "id", "userId", "groupId", "isAdmin" FROM user_groups WHERE "groupId"=$1 AND "userId"=$2`)
+	if err != nil {
+		return nil, err
+	}
+	_, err = sb.WriteString("LIMIT 1")
+	if err != nil {
+		return nil, err
+	}
+
+	var ret []*GroupMember
+	err = pgxscan.Select(ctx, c.db, &ret, sb.String(), args...)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if len(ret) == 0 {
+		return nil, nil
+	}
+
+	return ret[0], nil
+}
+
+func (c *Client) AddGroupMember(ctx context.Context, groupID, userID int64, isAdmin bool) error {
+	l := ctxzap.Extract(ctx)
+	l.Debug("add user to group", zap.Int64("user_id", userID))
+
+	args := []interface{}{groupID, userID, isAdmin}
+	sb := &strings.Builder{}
+	_, err := sb.WriteString(`INSERT INTO user_groups ("groupId", "userId", "isAdmin", "createdAt", "updatedAt") VALUES ($1, $2, $3, NOW(), NOW())`)
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) UpdateGroupMember(ctx context.Context, groupID, userID int64, isAdmin bool) (*GroupMember, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("update user in group", zap.Int64("user_id", userID))
+
+	args := []interface{}{groupID, userID, isAdmin}
+	sb := &strings.Builder{}
+	_, err := sb.WriteString(`UPDATE user_groups SET "isAdmin"=$3, "updatedAt" = NOW() WHERE "groupId"=$1 AND "userId"=$2`)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+		return nil, err
+	}
+
+	return c.GetGroupMember(ctx, groupID, userID)
+}
+
+func (c *Client) RemoveGroupMember(ctx context.Context, groupID, userID int64) error {
+	l := ctxzap.Extract(ctx)
+	l.Debug("remove user from group", zap.Int64("user_id", userID))
+
+	args := []interface{}{groupID, userID}
+	sb := &strings.Builder{}
+	_, err := sb.WriteString(`DELETE FROM user_groups WHERE "groupId"=$1 AND "userId"=$2`)
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+		return err
+	}
+
+	return nil
+}
