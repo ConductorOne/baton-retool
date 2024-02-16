@@ -19,8 +19,9 @@ var resourceTypeResource = &v2.ResourceType{
 }
 
 type resourceSyncer struct {
-	resourceType *v2.ResourceType
-	client       *client.Client
+	resourceType      *v2.ResourceType
+	client            *client.Client
+	skipDisabledUsers bool
 }
 
 func (s *resourceSyncer) ResourceType(ctx context.Context) *v2.ResourceType {
@@ -166,7 +167,7 @@ func (s *resourceSyncer) Grants(ctx context.Context, resource *v2.Resource, pTok
 			return nil, "", nil, err
 		}
 
-		members, nextPageToken, err := s.client.ListGroupMembers(ctx, group.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size})
+		members, nextPageToken, err := s.client.ListGroupMembers(ctx, group.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size}, s.skipDisabledUsers)
 		if err != nil {
 			return nil, "", nil, err
 		}
@@ -219,9 +220,10 @@ func (s *resourceSyncer) Grants(ctx context.Context, resource *v2.Resource, pTok
 	return ret, nextPageToken, nil, nil
 }
 
-func newResourceSyncer(ctx context.Context, c *client.Client) *resourceSyncer {
+func newResourceSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *resourceSyncer {
 	return &resourceSyncer{
-		resourceType: resourceTypeResource,
-		client:       c,
+		resourceType:      resourceTypeResource,
+		client:            c,
+		skipDisabledUsers: skipDisabledUsers,
 	}
 }

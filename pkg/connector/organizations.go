@@ -20,10 +20,11 @@ var resourceTypeOrg = &v2.ResourceType{
 }
 
 type orgSyncer struct {
-	resourceType  *v2.ResourceType
-	client        *client.Client
-	skipPages     bool
-	skipResources bool
+	resourceType      *v2.ResourceType
+	client            *client.Client
+	skipPages         bool
+	skipResources     bool
+	skipDisabledUsers bool
 }
 
 func (s *orgSyncer) ResourceType(ctx context.Context) *v2.ResourceType {
@@ -245,7 +246,7 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 			return nil, "", nil, err
 		}
 
-		members, nextPageToken, err := s.client.ListGroupMembers(ctx, g.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size})
+		members, nextPageToken, err := s.client.ListGroupMembers(ctx, g.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size}, s.skipDisabledUsers)
 		if err != nil {
 			return nil, "", nil, err
 		}
@@ -281,11 +282,12 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 	return ret, nextPageToken, nil, nil
 }
 
-func newOrgSyncer(ctx context.Context, c *client.Client, skipPages bool, skipResources bool) *orgSyncer {
+func newOrgSyncer(ctx context.Context, c *client.Client, skipPages bool, skipResources bool, skipDisabledUsers bool) *orgSyncer {
 	return &orgSyncer{
-		resourceType:  resourceTypeOrg,
-		client:        c,
-		skipPages:     skipPages,
-		skipResources: skipResources,
+		resourceType:      resourceTypeOrg,
+		client:            c,
+		skipPages:         skipPages,
+		skipResources:     skipResources,
+		skipDisabledUsers: skipDisabledUsers,
 	}
 }

@@ -66,6 +66,7 @@ type GroupMember struct {
 	UserID  *int64 `db:"userId"`
 	GroupID *int64 `db:"groupId"`
 	IsAdmin bool   `db:"isAdmin"`
+	Enabled bool   `db:"enabled"`
 }
 
 func (g *GroupMember) GetUserID() int64 {
@@ -152,7 +153,7 @@ func (c *Client) GetGroupResourceFolderDefault(ctx context.Context, groupID int6
 	return &ret, nil
 }
 
-func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pager) ([]*GroupMember, string, error) {
+func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pager, skipDisabledUsers bool) ([]*GroupMember, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing group members for group", zap.Int64("group_id", groupID))
 
@@ -165,7 +166,12 @@ func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pag
 	args = append(args, groupID)
 
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 ORDER BY "id" `)
+	if skipDisabledUsers {
+		_, _ = sb.WriteString(`select user_groups.id as id, "userId", "groupId", "isAdmin", users.enabled from user_groups
+		 INNER JOIN users ON users.id = "user_groups"."userId" WHERE "groupId"=$1 and users.enabled = true ORDER BY "id" `)
+	} else {
+		_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 ORDER BY "id" `)
+	}
 
 	args = append(args, limit+1)
 	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))

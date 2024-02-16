@@ -36,6 +36,7 @@ func main() {
 
 	cmd.PersistentFlags().Bool("skip-pages", false, "Skip syncing pages")
 	cmd.PersistentFlags().Bool("skip-resources", false, "Skip syncing resources")
+	cmd.PersistentFlags().Bool("skip-disabled-users", false, "Skip syncing disabled users")
 
 	err = cmd.Execute()
 	if err != nil {
@@ -47,7 +48,7 @@ func main() {
 func getConnector(ctx context.Context, cfg *config) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	cb, err := connector.New(ctx, cfg.ConnectionString, cfg.SkipPages, cfg.SkipResources)
+	cb, err := connector.New(ctx, cfg.ConnectionString, cfg.SkipPages, cfg.SkipResources, cfg.SkipDisabledUsers)
 	if err != nil {
 		l.Error("error creating connector builder", zap.Error(err))
 		return nil, err

@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	MaxPageSize = 100
+	MaxPageSize = 250
 	MinPageSize = 10
 )
 

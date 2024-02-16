@@ -33,8 +33,9 @@ func memberEntitlementId(groupID *v2.ResourceId) string {
 }
 
 type groupSyncer struct {
-	resourceType *v2.ResourceType
-	client       *client.Client
+	resourceType      *v2.ResourceType
+	client            *client.Client
+	skipDisabledUsers bool
 }
 
 func (s *groupSyncer) ResourceType(ctx context.Context) *v2.ResourceType {
@@ -131,7 +132,7 @@ func (s *groupSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken 
 		return nil, "", nil, err
 	}
 
-	members, nextPageToken, err := s.client.ListGroupMembers(ctx, groupID, &client.Pager{Token: pToken.Token, Size: pToken.Size})
+	members, nextPageToken, err := s.client.ListGroupMembers(ctx, groupID, &client.Pager{Token: pToken.Token, Size: pToken.Size}, s.skipDisabledUsers)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -246,9 +247,10 @@ func (o *groupSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.
 	return nil, nil
 }
 
-func newGroupSyncer(ctx context.Context, c *client.Client) *groupSyncer {
+func newGroupSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *groupSyncer {
 	return &groupSyncer{
-		resourceType: resourceTypeGroup,
-		client:       c,
+		resourceType:      resourceTypeGroup,
+		client:            c,
+		skipDisabledUsers: skipDisabledUsers,
 	}
 }
