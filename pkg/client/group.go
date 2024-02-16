@@ -167,7 +167,8 @@ func (c *Client) ListGroupMembers(ctx context.Context, groupID int64, pager *Pag
 
 	sb := &strings.Builder{}
 	if skipDisabledUsers {
-		_, _ = sb.WriteString(`select user_groups.id as id, "userId", "groupId", "isAdmin", users.enabled from user_groups INNER JOIN users ON users.id = "user_groups"."userId" WHERE "groupId"=$1 and users.enabled = true ORDER BY "id" `)
+		_, _ = sb.WriteString(`select user_groups.id as id, "userId", "groupId", "isAdmin", users.enabled from user_groups
+		 INNER JOIN users ON users.id = "user_groups"."userId" WHERE "groupId"=$1 and users.enabled = true ORDER BY "id" `)
 	} else {
 		_, _ = sb.WriteString(`select "id", "userId", "groupId", "isAdmin" from user_groups WHERE "groupId"=$1 ORDER BY "id" `)
 	}
