@@ -65,7 +65,7 @@ func (u *UserModel) GetLastLoggedIn() time.Time {
 	return time.Time{}
 }
 
-func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*UserModel, string, error) {
+func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager, skipDisabledUsers bool) ([]*UserModel, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing users for org", zap.Int64("org_id", orgID))
 
@@ -78,6 +78,9 @@ func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager)
 	sb := &strings.Builder{}
 	_, _ = sb.WriteString(`SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" from users WHERE "organizationId"=$1 `)
 	args = append(args, orgID)
+	if skipDisabledUsers {
+		_, _ = sb.WriteString("AND enabled = true ")
+	}
 	_, _ = sb.WriteString(`ORDER BY "id" `)
 	_, _ = sb.WriteString("LIMIT $2 ")
 	args = append(args, limit+1)

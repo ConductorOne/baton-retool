@@ -20,9 +20,10 @@ func titleCase(s string) string {
 }
 
 type ConnectorImpl struct {
-	client        *client.Client
-	skipPages     bool
-	skipResources bool
+	client            *client.Client
+	skipPages         bool
+	skipResources     bool
+	skipDisabledUsers bool
 }
 
 func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
@@ -47,7 +48,7 @@ func (c *ConnectorImpl) Asset(ctx context.Context, asset *v2.AssetRef) (string, 
 func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
 	syncers := []connectorbuilder.ResourceSyncer{
 		newOrgSyncer(ctx, c.client, c.skipPages, c.skipResources),
-		newUserSyncer(ctx, c.client),
+		newUserSyncer(ctx, c.client, c.skipDisabledUsers),
 		newGroupSyncer(ctx, c.client),
 	}
 
@@ -62,15 +63,16 @@ func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.
 	return syncers
 }
 
-func New(ctx context.Context, dsn string, skipPages bool, skipResources bool) (*ConnectorImpl, error) {
+func New(ctx context.Context, dsn string, skipPages bool, skipResources bool, skipDisabledUsers bool) (*ConnectorImpl, error) {
 	c, err := client.New(ctx, dsn)
 	if err != nil {
 		return nil, err
 	}
 
 	return &ConnectorImpl{
-		client:        c,
-		skipPages:     skipPages,
-		skipResources: skipResources,
+		client:            c,
+		skipPages:         skipPages,
+		skipResources:     skipResources,
+		skipDisabledUsers: skipDisabledUsers,
 	}, nil
 }
