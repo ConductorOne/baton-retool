@@ -47,17 +47,17 @@ func (c *ConnectorImpl) Asset(ctx context.Context, asset *v2.AssetRef) (string, 
 
 func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.ResourceSyncer {
 	syncers := []connectorbuilder.ResourceSyncer{
-		newOrgSyncer(ctx, c.client, c.skipPages, c.skipResources),
+		newOrgSyncer(ctx, c.client, c.skipPages, c.skipResources, c.skipDisabledUsers),
 		newUserSyncer(ctx, c.client, c.skipDisabledUsers),
-		newGroupSyncer(ctx, c.client),
+		newGroupSyncer(ctx, c.client, c.skipDisabledUsers),
 	}
 
 	if !c.skipPages {
-		syncers = append(syncers, newPageSyncer(ctx, c.client))
+		syncers = append(syncers, newPageSyncer(ctx, c.client, c.skipDisabledUsers))
 	}
 
 	if !c.skipResources {
-		syncers = append(syncers, newResourceSyncer(ctx, c.client))
+		syncers = append(syncers, newResourceSyncer(ctx, c.client, c.skipDisabledUsers))
 	}
 
 	return syncers
