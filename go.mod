@@ -3,7 +3,7 @@ module github.com/conductorone/baton-retool
 go 1.20
 
 require (
-	github.com/conductorone/baton-sdk v0.1.21
+	github.com/conductorone/baton-sdk v0.1.22
 	github.com/georgysavva/scany v1.2.1
 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0
 	github.com/jackc/pgx/v4 v4.18.1
