@@ -1,27 +1,36 @@
 package main
 
 import (
-	"context"
-	"fmt"
-
-	"github.com/conductorone/baton-sdk/pkg/cli"
+	"github.com/conductorone/baton-sdk/pkg/field"
 )
 
-// config defines the external configuration required for the connector to run.
-type config struct {
-	cli.BaseConfig `mapstructure:",squash"` // Puts the base config options in the same place as the connector options
+var (
+	ConnectionString = field.StringField(
+		"connection-string",
+		field.WithRequired(true),
+		field.WithDescription("The connection string for connecting to retool database"),
+	)
+	SkipPages = field.BoolField(
+		"skip-pages",
+		field.WithDescription("Skip syncing pages"),
+	)
+	SkipResources = field.BoolField(
+		"skip-resources",
+		field.WithDescription("Skip syncing resources"),
+	)
+	SkipDisabledUsers = field.BoolField(
+		"skip-disabled-users",
+		field.WithDescription("Skip syncing disabled users"),
+	)
+)
 
-	ConnectionString  string `mapstructure:"connection-string"`
-	SkipPages         bool   `mapstructure:"skip-pages"`
-	SkipResources     bool   `mapstructure:"skip-resources"`
-	SkipDisabledUsers bool   `mapstructure:"skip-disabled-users"`
+var configurationFields = []field.SchemaField{
+	ConnectionString,
+	SkipPages,
+	SkipResources,
+	SkipDisabledUsers,
 }
 
-// validateConfig is run after the configuration is loaded, and should return an error if it isn't valid.
-func validateConfig(ctx context.Context, cfg *config) error {
-	if cfg.ConnectionString == "" {
-		return fmt.Errorf("--connection-string is required")
-	}
+var configRelations = []field.SchemaFieldRelationship{}
 
-	return nil
-}
+var configuration = field.NewConfiguration(configurationFields, configRelations...)

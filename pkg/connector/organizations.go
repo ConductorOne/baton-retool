@@ -231,12 +231,12 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 		for _, g := range groups {
 			bag.Push(pagination.PageState{
 				ResourceTypeID: resourceTypeGroup.Id,
-				ResourceID:     formatObjectID(resourceTypeGroup.Id, g.ID),
+				ResourceID:     formatGroupObjectID(g.ID),
 			})
 		}
 
 	case resourceTypeGroup.Id:
-		gID, err := parseObjectID(bag.ResourceID())
+		gID, err := parseGroupObjectID(bag.ResourceID())
 		if err != nil {
 			return nil, "", nil, err
 		}
