@@ -152,12 +152,12 @@ func (s *resourceSyncer) Grants(ctx context.Context, resource *v2.Resource, pTok
 		for _, g := range groups {
 			bag.Push(pagination.PageState{
 				ResourceTypeID: resourceTypeGroup.Id,
-				ResourceID:     formatObjectID(resourceTypeGroup.Id, g.ID),
+				ResourceID:     formatGroupObjectID(g.ID),
 			})
 		}
 
 	case resourceTypeGroup.Id:
-		groupID, err := parseObjectID(bag.ResourceID())
+		groupID, err := parseGroupObjectID(bag.ResourceID())
 		if err != nil {
 			return nil, "", nil, err
 		}

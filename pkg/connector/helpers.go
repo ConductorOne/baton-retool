@@ -22,6 +22,14 @@ func parseObjectID(id string) (int64, error) {
 	return strconv.ParseInt(parts[1], 10, 64)
 }
 
+func formatGroupObjectID(id int64) string {
+	return fmt.Sprintf("%d", id)
+}
+
+func parseGroupObjectID(id string) (int64, error) {
+	return strconv.ParseInt(id, 10, 64)
+}
+
 func parsePageToken(i string, resourceID *v2.ResourceId) (*pagination.Bag, error) {
 	b := &pagination.Bag{}
 	err := b.Unmarshal(i)
