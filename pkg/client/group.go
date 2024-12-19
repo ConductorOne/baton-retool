@@ -279,11 +279,7 @@ func (c *Client) GetGroupMember(ctx context.Context, groupID, userID int64) (*Gr
 	args = append(args, userID)
 
 	sb := &strings.Builder{}
-	_, err := sb.WriteString(`SELECT "id", "userId", "groupId", "isAdmin" FROM user_groups WHERE "groupId"=$1 AND "userId"=$2`)
-	if err != nil {
-		return nil, err
-	}
-	_, err = sb.WriteString("LIMIT 1")
+	_, err := sb.WriteString(`SELECT "id", "userId", "groupId", "isAdmin" FROM user_groups WHERE "groupId"=$1 AND "userId"=$2 LIMIT 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -309,13 +305,8 @@ func (c *Client) AddGroupMember(ctx context.Context, groupID, userID int64, isAd
 	l.Debug("add user to group", zap.Int64("user_id", userID))
 
 	args := []interface{}{groupID, userID, isAdmin}
-	sb := &strings.Builder{}
-	_, err := sb.WriteString(`INSERT INTO user_groups ("groupId", "userId", "isAdmin", "createdAt", "updatedAt") VALUES ($1, $2, $3, NOW(), NOW())`)
-	if err != nil {
-		return err
-	}
 
-	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+	if _, err := c.db.Exec(ctx, `INSERT INTO user_groups ("groupId", "userId", "isAdmin", "createdAt", "updatedAt") VALUES ($1, $2, $3, NOW(), NOW())`, args...); err != nil {
 		return err
 	}
 
