@@ -7,9 +7,7 @@ import (
 	"strings"
 )
 
-var (
-	WrongValueTypeErr = errors.New("unable to cast any to concrete type")
-)
+var WrongValueTypeErr = errors.New("unable to cast any to concrete type")
 
 type SchemaField struct {
 	FieldName    string
@@ -17,6 +15,7 @@ type SchemaField struct {
 	CLIShortHand string
 	Required     bool
 	Hidden       bool
+	Persistent   bool
 	Description  string
 	DefaultValue any
 }
@@ -51,8 +50,8 @@ func (s SchemaField) String() (string, error) {
 	return value, nil
 }
 
-// StringArray retuns the default value as a string array.
-func (s SchemaField) StringArray() ([]string, error) {
+// StringSlice returns the default value as a string array.
+func (s SchemaField) StringSlice() ([]string, error) {
 	value, ok := s.DefaultValue.([]string)
 	if !ok {
 		return nil, WrongValueTypeErr
@@ -130,7 +129,7 @@ func IntField(name string, optional ...fieldOption) SchemaField {
 	return field
 }
 
-func StringArrayField(name string, optional ...fieldOption) SchemaField {
+func StringSliceField(name string, optional ...fieldOption) SchemaField {
 	field := SchemaField{
 		FieldName:    name,
 		FieldType:    reflect.Slice,
