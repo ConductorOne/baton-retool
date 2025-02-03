@@ -191,6 +191,9 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 			}
 
 			for _, level := range pageAccessLevels {
+				var annos annotations.Annotations
+				annos.Update(&v2.GrantImmutable{})
+
 				eID := fmt.Sprintf("entitlement:%s:%s", resource.Id.Resource, level)
 				ret = append(ret, &v2.Grant{
 					Entitlement: &v2.Entitlement{
@@ -200,7 +203,8 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 					Principal: &v2.Resource{
 						Id: principalID,
 					},
-					Id: fmt.Sprintf("grant:%s:%s", eID, principalID.Resource),
+					Id:          fmt.Sprintf("grant:%s:%s", eID, principalID.Resource),
+					Annotations: annos,
 				})
 			}
 		}
