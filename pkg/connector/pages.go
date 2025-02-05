@@ -2,14 +2,18 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	ent "github.com/conductorone/baton-sdk/pkg/types/entitlement"
+	"github.com/conductorone/baton-sdk/pkg/types/grant"
+	"github.com/jackc/pgx/v4"
+
+	"github.com/conductorone/baton-retool/pkg/client"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-
-	"github.com/conductorone/baton-retool/pkg/client"
+	rs "github.com/conductorone/baton-sdk/pkg/types/resource"
 )
 
 var resourceTypePage = &v2.ResourceType{
@@ -63,19 +67,18 @@ func (s *pageSyncer) List(
 
 func (s *pageSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pToken *pagination.Token) ([]*v2.Entitlement, string, annotations.Annotations, error) {
 	var ret []*v2.Entitlement
-	var annos annotations.Annotations
 
 	for _, level := range accessLevels {
-		ret = append(ret, &v2.Entitlement{
-			Resource:    resource,
-			Id:          fmt.Sprintf("entitlement:%s:%s", resource.Id.Resource, level),
-			DisplayName: fmt.Sprintf("%s %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level])),
-			Description: fmt.Sprintf("Has %s access on the %s page", accessLevelDisplayNames[level], resource.DisplayName),
-			GrantableTo: []*v2.ResourceType{resourceTypeUser},
-			Annotations: annos,
-			Purpose:     v2.Entitlement_PURPOSE_VALUE_PERMISSION,
-			Slug:        accessLevelDisplayNames[level],
-		})
+		entitlement := ent.NewPermissionEntitlement(
+			resource,
+			level,
+			ent.WithGrantableTo(resourceTypeGroup),
+			ent.WithDisplayName(fmt.Sprintf("%s %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level]))),
+			ent.WithDescription(fmt.Sprintf("Has %s access on the %s page", accessLevelDisplayNames[level], resource.DisplayName)),
+		)
+		entitlement.Slug = accessLevelDisplayNames[level]
+
+		ret = append(ret, entitlement)
 	}
 
 	return ret, "", nil, nil
@@ -110,7 +113,6 @@ func (s *pageSyncer) pageAccessLevelsForGroup(ctx context.Context, page *client.
 }
 
 func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *pagination.Token) ([]*v2.Grant, string, annotations.Annotations, error) {
-	l := ctxzap.Extract(ctx)
 	var ret []*v2.Grant
 
 	pageID, err := parseObjectID(resource.Id.Resource)
@@ -164,50 +166,30 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 			return nil, "", nil, err
 		}
 
-		members, nextPageToken, err := s.client.ListGroupMembers(ctx, group.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size}, s.skipDisabledUsers)
-		if err != nil {
-			return nil, "", nil, err
-		}
-
-		err = bag.Next(nextPageToken)
-		if err != nil {
-			return nil, "", nil, err
-		}
-
 		pageAccessLevels, err := s.pageAccessLevelsForGroup(ctx, page, group)
 		if err != nil {
 			return nil, "", nil, err
 		}
 
-		for _, m := range members {
-			if m.GetUserID() == 0 {
-				l.Debug("member did not have user ID defined -- skipping")
-				continue
+		for _, level := range pageAccessLevels {
+			groupId, err := rs.NewResourceID(resourceTypeGroup, formatObjectID(resourceTypeGroup.Id, group.ID))
+			if err != nil {
+				return nil, "", nil, err
 			}
 
-			principalID := &v2.ResourceId{
-				ResourceType: resourceTypeUser.Id,
-				Resource:     formatObjectID(resourceTypeUser.Id, m.GetUserID()),
+			grantExpandable := &v2.GrantExpandable{
+				EntitlementIds: []string{
+					fmt.Sprintf("group:%s:member", groupId.Resource),
+					fmt.Sprintf("group:%s:admin", groupId.Resource),
+				},
 			}
 
-			for _, level := range pageAccessLevels {
-				var annos annotations.Annotations
-				annos.Update(&v2.GrantImmutable{})
+			newGrant := grant.NewGrant(resource, level, groupId, grant.WithAnnotation(grantExpandable))
 
-				eID := fmt.Sprintf("entitlement:%s:%s", resource.Id.Resource, level)
-				ret = append(ret, &v2.Grant{
-					Entitlement: &v2.Entitlement{
-						Id:       eID,
-						Resource: resource,
-					},
-					Principal: &v2.Resource{
-						Id: principalID,
-					},
-					Id:          fmt.Sprintf("grant:%s:%s", eID, principalID.Resource),
-					Annotations: annos,
-				})
-			}
+			ret = append(ret, newGrant)
 		}
+
+		bag.Pop()
 
 	default:
 		return nil, "", nil, fmt.Errorf("unexpected resource type while processing page grants: %s", bag.ResourceTypeID())
@@ -219,6 +201,92 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 	}
 
 	return ret, nextPageToken, nil, nil
+}
+
+func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitlement *v2.Entitlement) ([]*v2.Grant, annotations.Annotations, error) {
+	if resource.Id.ResourceType != resourceTypeGroup.Id {
+		return nil, nil, fmt.Errorf("unexpected resource type while processing page grant: %s", resource.Id.ResourceType)
+	}
+
+	groupID, err := parseObjectID(resource.Id.Resource)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pageID, err := parseObjectID(resource.Id.Resource)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	accessLevel := entitlement.Slug
+
+	page, err := s.client.GetGroupPage(ctx, pageID, groupID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, err
+		}
+	}
+
+	// Update the group page
+	if page != nil {
+		if page.AccessLevel == accessLevel {
+			return nil, annotations.New(&v2.GrantAlreadyExists{}), nil
+		}
+
+		err := s.client.UpdateGroupPage(ctx, page.ID, groupID, accessLevel)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		// Create the group page
+		err := s.client.InsertGroupPage(ctx, pageID, groupID, accessLevel)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	grantExpandable := &v2.GrantExpandable{
+		EntitlementIds: []string{
+			fmt.Sprintf("group:%s:member", resource.Id.Resource),
+			fmt.Sprintf("group:%s:admin", resource.Id.Resource),
+		},
+	}
+
+	newGrant := grant.NewGrant(resource, accessLevel, resource.Id, grant.WithAnnotation(grantExpandable))
+
+	return []*v2.Grant{newGrant}, nil, nil
+}
+
+func (s *pageSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.Annotations, error) {
+	if grant.Principal.Id.ResourceType != resourceTypeGroup.Id {
+		return nil, fmt.Errorf("unexpected resource type while processing page grant: %s", grant.Principal.Id.ResourceType)
+	}
+
+	groupID, err := parseObjectID(grant.Principal.Id.Resource)
+	if err != nil {
+		return nil, err
+	}
+
+	pageID, err := parseObjectID(grant.Entitlement.Resource.Id.Resource)
+	if err != nil {
+		return nil, err
+	}
+
+	page, err := s.client.GetGroupPage(ctx, pageID, groupID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return annotations.New(&v2.GrantAlreadyRevoked{}), nil
+		} else {
+			return nil, err
+		}
+	}
+
+	err = s.client.DeleteGroupPage(ctx, page.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
 }
 
 func newPageSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *pageSyncer {
