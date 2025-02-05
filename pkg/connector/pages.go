@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	ent "github.com/conductorone/baton-sdk/pkg/types/entitlement"
 	"github.com/conductorone/baton-sdk/pkg/types/grant"
@@ -208,7 +209,7 @@ func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitleme
 		return nil, nil, fmt.Errorf("unexpected resource type while processing page grant: %s", resource.Id.ResourceType)
 	}
 
-	groupID, err := parseObjectID(resource.Id.Resource)
+	groupID, err := parseObjectID(entitlement.Resource.Id.Resource)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -218,7 +219,11 @@ func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitleme
 		return nil, nil, err
 	}
 
-	accessLevel := entitlement.Slug
+	splitV := strings.Split(entitlement.Id, ":")
+	if len(splitV) != 3 {
+		return nil, nil, fmt.Errorf("unexpected entitlement ID format while processing page grant: %s", entitlement.Id)
+	}
+	accessLevel := splitV[len(splitV)-1]
 
 	page, err := s.client.GetGroupPage(ctx, pageID, groupID)
 	if err != nil {
@@ -233,7 +238,7 @@ func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitleme
 			return nil, annotations.New(&v2.GrantAlreadyExists{}), nil
 		}
 
-		err := s.client.UpdateGroupPage(ctx, page.ID, groupID, accessLevel)
+		err := s.client.UpdateGroupPage(ctx, page.ID, accessLevel)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -272,13 +277,23 @@ func (s *pageSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.A
 		return nil, err
 	}
 
-	page, err := s.client.GetGroupPage(ctx, pageID, groupID)
+	splitV := strings.Split(grant.Entitlement.Id, ":")
+	if len(splitV) != 3 {
+		return nil, fmt.Errorf("unexpected entitlement ID format while processing page grant: %s", grant.Entitlement.Id)
+	}
+	accessLevel := splitV[len(splitV)-1]
+
+	page, err := s.client.GetGroupPage(ctx, groupID, pageID)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return annotations.New(&v2.GrantAlreadyRevoked{}), nil
 		} else {
 			return nil, err
 		}
+	}
+
+	if page.AccessLevel != accessLevel {
+		return annotations.New(&v2.GrantAlreadyRevoked{}), nil
 	}
 
 	err = s.client.DeleteGroupPage(ctx, page.ID)

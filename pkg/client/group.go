@@ -117,15 +117,17 @@ func (c *Client) InsertGroupPage(ctx context.Context, groupID int64, pageID int6
 	return nil
 }
 
-func (c *Client) UpdateGroupPage(ctx context.Context, groupID int64, pageID int64, accessLevel string) error {
+func (c *Client) UpdateGroupPage(ctx context.Context, id int64, accessLevel string) error {
 	l := ctxzap.Extract(ctx)
-	l.Debug("updating group page", zap.Int64("group_id", groupID), zap.Int64("page_id", pageID), zap.String("access_level", accessLevel))
+	l.Debug("updating group page", zap.Int64("id", id), zap.String("access_level", accessLevel))
 
-	args := []interface{}{accessLevel, groupID, pageID}
+	args := []interface{}{accessLevel, id}
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`UPDATE group_pages SET "accessLevel" = $1 WHERE "groupId"=$2 AND "pageId"=$3`)
+	_, _ = sb.WriteString(`UPDATE group_pages SET "accessLevel" = $1 WHERE "id"=$2`)
 
-	if _, err := c.db.Exec(ctx, sb.String(), args...); err != nil {
+	_, err := c.db.Exec(ctx, sb.String(), args...)
+
+	if err != nil {
 		return err
 	}
 
