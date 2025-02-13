@@ -53,7 +53,7 @@ func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.
 	}
 
 	if !c.skipPages {
-		syncers = append(syncers, newPageSyncer(ctx, c.client, c.skipDisabledUsers))
+		syncers = append(syncers, newPageSyncer(c.client, c.skipDisabledUsers))
 	}
 
 	if !c.skipResources {

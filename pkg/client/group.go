@@ -266,6 +266,38 @@ func (c *Client) GetGroup(ctx context.Context, groupID int64) (*GroupModel, erro
 	return &ret, nil
 }
 
+func (c *Client) GetGroupByName(ctx context.Context, organizationID *int64, name string) (*GroupModel, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("getting group by name", zap.Any("organization_id", organizationID), zap.String("name", name))
+
+	args := []interface{}{organizationID, name}
+	sb := &strings.Builder{}
+	_, _ = sb.WriteString(`select "id", "name", "organizationId", "universalAccess", "universalResourceAccess",
+       						  "universalQueryLibraryAccess", "userListAccess", "auditLogAccess", "unpublishedReleaseAccess"
+							  from groups WHERE "organizationId"=$1 AND "name"=$2`)
+
+	var ret GroupModel
+	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ret, nil
+}
+
+func (c *Client) CreateGroup(ctx context.Context, organizationID *int64, name string) error {
+	l := ctxzap.Extract(ctx)
+	l.Debug("create group", zap.Any("organization_id", organizationID), zap.String("name", name))
+
+	args := []interface{}{name, organizationID}
+
+	if _, err := c.db.Exec(ctx, `INSERT INTO groups ("name", "organizationId", "createdAt", "updatedAt", "archivedAt", "usageAnalyticsAccess", "themeAccess", "unpublishedReleaseAccess", "accountDetailsAccess") VALUES ($1, $2,NOW(), NOW(), NULL, false, false, false, false)`, args...); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (c *Client) ListGroupsForOrg(ctx context.Context, orgID int64, pager *Pager) ([]*GroupModel, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing groups for org", zap.Int64("org_id", orgID))
