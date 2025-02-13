@@ -155,7 +155,7 @@ func (c *Client) GetGroupFolderDefault(ctx context.Context, groupID int64, folde
 
 	args := []interface{}{groupID, folderID}
 	sb := &strings.Builder{}
-	_, _ = sb.WriteString(``)
+	_, _ = sb.WriteString(`select "id", "accessLevel" from group_folder_defaults WHERE "groupId"=$1 AND "folderId"=$2`)
 
 	var ret GroupFolderDefault
 	err := pgxscan.Get(ctx, c.db, &ret, sb.String(), args...)
