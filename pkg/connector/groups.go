@@ -8,7 +8,9 @@ import (
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
+	ent "github.com/conductorone/baton-sdk/pkg/types/entitlement"
+	"github.com/conductorone/baton-sdk/pkg/types/grant"
+	rs "github.com/conductorone/baton-sdk/pkg/types/resource"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 )
@@ -23,14 +25,6 @@ const (
 	adminEntitlementSlug  = "admin"
 	memberEntitlementSlug = "member"
 )
-
-func adminEntitlementId(groupID *v2.ResourceId) string {
-	return fmt.Sprintf("entitlement:%s:admin", groupID.Resource)
-}
-
-func memberEntitlementId(groupID *v2.ResourceId) string {
-	return fmt.Sprintf("entitlement:%s:member", groupID.Resource)
-}
 
 type groupSyncer struct {
 	resourceType      *v2.ResourceType
@@ -66,61 +60,48 @@ func (s *groupSyncer) List(
 	}
 
 	var ret []*v2.Resource
-	for _, o := range groups {
-		var annos annotations.Annotations
 
+	for _, o := range groups {
 		p := make(map[string]interface{})
 
 		if o.OrganizationID != nil {
 			p["organization_id"] = o.GetOrgID()
 		}
 
-		gt, err := resources.NewGroupTrait(resources.WithGroupProfile(p))
+		options := []rs.ResourceOption{
+			rs.WithGroupTrait(rs.WithGroupProfile(p)),
+			rs.WithParentResourceID(parentResourceID),
+		}
+
+		resource, err := rs.NewResource(o.GetName(), s.resourceType, formatObjectID(resourceTypeGroup.Id, o.ID), options...)
 		if err != nil {
 			return nil, "", nil, err
 		}
 
-		annos.Append(gt)
-
-		ret = append(ret, &v2.Resource{
-			DisplayName: o.GetName(),
-			Id: &v2.ResourceId{
-				ResourceType: s.resourceType.Id,
-				Resource:     formatObjectID(s.resourceType.Id, o.ID),
-			},
-			ParentResourceId: parentResourceID,
-			Annotations:      annos,
-		})
+		ret = append(ret, resource)
 	}
 
 	return ret, nextPageToken, nil, nil
 }
 
 func (s *groupSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pToken *pagination.Token) ([]*v2.Entitlement, string, annotations.Annotations, error) {
-	var ret []*v2.Entitlement
-	var annos annotations.Annotations
+	ret := []*v2.Entitlement{
+		ent.NewAssignmentEntitlement(
+			resource,
+			memberEntitlementSlug,
+			ent.WithGrantableTo(resourceTypeUser),
+			ent.WithDisplayName(fmt.Sprintf("%s Group Member", resource.DisplayName)),
+			ent.WithDescription(fmt.Sprintf("Is member of the %s group", resource.DisplayName)),
+		),
+		ent.NewAssignmentEntitlement(
+			resource,
+			adminEntitlementSlug,
+			ent.WithGrantableTo(resourceTypeUser),
+			ent.WithDisplayName(fmt.Sprintf("%s Group Admin", resource.DisplayName)),
+			ent.WithDescription(fmt.Sprintf("Is admin of the %s group", resource.DisplayName)),
+		),
+	}
 
-	ret = append(ret, &v2.Entitlement{
-		Resource:    resource,
-		Id:          memberEntitlementId(resource.Id),
-		DisplayName: fmt.Sprintf("%s Group Member", resource.DisplayName),
-		Description: fmt.Sprintf("Is member of the %s organization", resource.DisplayName),
-		GrantableTo: []*v2.ResourceType{resourceTypeUser},
-		Annotations: annos,
-		Purpose:     v2.Entitlement_PURPOSE_VALUE_ASSIGNMENT,
-		Slug:        memberEntitlementSlug,
-	})
-
-	ret = append(ret, &v2.Entitlement{
-		Resource:    resource,
-		Id:          adminEntitlementId(resource.Id),
-		DisplayName: fmt.Sprintf("%s Group Admin", resource.DisplayName),
-		Description: fmt.Sprintf("Is admin of the %s group", resource.DisplayName),
-		GrantableTo: []*v2.ResourceType{resourceTypeUser},
-		Annotations: annos,
-		Purpose:     v2.Entitlement_PURPOSE_VALUE_ASSIGNMENT,
-		Slug:        adminEntitlementSlug,
-	})
 	return ret, "", nil, nil
 }
 
@@ -142,22 +123,15 @@ func (s *groupSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken 
 		if m.IsAdmin {
 			level = "admin"
 		}
-		entitlementID := fmt.Sprintf("entitlement:%s:%s", resource.Id.Resource, level)
-		principalID := formatObjectID(resourceTypeUser.Id, m.GetUserID())
 
-		ret = append(ret, &v2.Grant{
-			Entitlement: &v2.Entitlement{
-				Id:       entitlementID,
-				Resource: resource,
-			},
-			Principal: &v2.Resource{
-				Id: &v2.ResourceId{
-					ResourceType: resourceTypeUser.Id,
-					Resource:     principalID,
-				},
-			},
-			Id: fmt.Sprintf("grant:%s:%s", entitlementID, principalID),
-		})
+		principalID, err := rs.NewResourceID(resourceTypeUser, formatObjectID(resourceTypeUser.Id, m.GetUserID()))
+		if err != nil {
+			return nil, "", nil, err
+		}
+
+		newGrant := grant.NewGrant(resource, level, principalID)
+
+		ret = append(ret, newGrant)
 	}
 
 	return ret, nextPageToken, nil, nil

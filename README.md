@@ -14,7 +14,7 @@ CREATE USER baton WITH PASSWORD 'secure-password';
 ```postgresql
 GRANT SELECT ("id", "name", "organizationId", "universalAccess", "universalResourceAccess", "universalQueryLibraryAccess",
               "userListAccess", "auditLogAccess", "unpublishedReleaseAccess") ON groups TO baton;
-GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") ON group_pages TO baton;
+GRANT SELECT, INSERT, UPDATE ("id", "accessLevel"), DELETE ON group_pages TO baton;
 GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") ON group_folder_defaults TO baton;
 GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") on group_resources TO baton;
 GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") on group_resource_folder_defaults TO baton;

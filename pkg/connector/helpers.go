@@ -3,23 +3,17 @@ package connector
 import (
 	"fmt"
 	"strconv"
-	"strings"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 )
 
 func formatObjectID(resourceTypeID string, id int64) string {
-	return fmt.Sprintf("%s:%d", resourceTypeID, id)
+	return fmt.Sprintf("%c%d", resourceTypeID[0], id)
 }
 
 func parseObjectID(id string) (int64, error) {
-	parts := strings.SplitN(id, ":", 2)
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("invalid object ID %s", id)
-	}
-
-	return strconv.ParseInt(parts[1], 10, 64)
+	return strconv.ParseInt(id[1:], 10, 64)
 }
 
 func formatGroupObjectID(id int64) string {
