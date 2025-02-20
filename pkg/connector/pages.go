@@ -76,6 +76,7 @@ func (s *pageSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pT
 			ent.WithGrantableTo(resourceTypeGroup),
 			ent.WithDisplayName(fmt.Sprintf("%s %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level]))),
 			ent.WithDescription(fmt.Sprintf("Has %s access on the %s page", accessLevelDisplayNames[level], resource.DisplayName)),
+			ent.WithAnnotation(&v2.EntitlementImmutable{}),
 		)
 
 		ret = append(ret, entitlement)
