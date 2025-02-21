@@ -72,12 +72,12 @@ func (s *pageSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pT
 	for _, level := range accessLevels {
 		entitlement := ent.NewPermissionEntitlement(
 			resource,
-			level,
+			fmt.Sprintf("%s:%s", "group", level),
 			ent.WithGrantableTo(resourceTypeGroup),
 			ent.WithDisplayName(fmt.Sprintf("%s %s Access", resource.DisplayName, titleCase(accessLevelDisplayNames[level]))),
 			ent.WithDescription(fmt.Sprintf("Has %s access on the %s page", accessLevelDisplayNames[level], resource.DisplayName)),
+			ent.WithAnnotation(&v2.EntitlementImmutable{}),
 		)
-		entitlement.Slug = accessLevelDisplayNames[level]
 
 		ret = append(ret, entitlement)
 	}
@@ -90,7 +90,6 @@ func (s *pageSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pT
 			ent.WithDisplayName(fmt.Sprintf("User can %s on %s", titleCase(accessLevelDisplayNames[level]), resource.DisplayName)),
 			ent.WithDescription(fmt.Sprintf("Has %s access on the %s page", accessLevelDisplayNames[level], resource.DisplayName)),
 		)
-		entitlement.Slug = accessLevelDisplayNames[level]
 
 		ret = append(ret, entitlement)
 	}
@@ -198,7 +197,7 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 				},
 			}
 
-			newGrant := grant.NewGrant(resource, level, groupId, grant.WithAnnotation(grantExpandable))
+			newGrant := grant.NewGrant(resource, fmt.Sprintf("%s:%s", "group", level), groupId, grant.WithAnnotation(grantExpandable))
 
 			ret = append(ret, newGrant)
 		}
@@ -221,12 +220,12 @@ func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitleme
 	switch resource.Id.ResourceType {
 	// Grant user to a page
 	case resourceTypeUser.Id:
-		userId, err := parseObjectID(entitlement.Resource.Id.Resource)
+		userId, err := parseObjectID(resource.Id.Resource)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		pageID, err := parseObjectID(resource.Id.Resource)
+		pageID, err := parseObjectID(entitlement.Resource.Id.Resource)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -247,18 +246,18 @@ func (s *pageSyncer) Grant(ctx context.Context, resource *v2.Resource, entitleme
 		return []*v2.Grant{newGrant}, nil, nil
 	// Grant group
 	case resourceTypeGroup.Id:
-		groupID, err := parseObjectID(entitlement.Resource.Id.Resource)
+		groupID, err := parseObjectID(resource.Id.Resource)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		pageID, err := parseObjectID(resource.Id.Resource)
+		pageID, err := parseObjectID(entitlement.Resource.Id.Resource)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		splitV := strings.Split(entitlement.Id, ":")
-		if len(splitV) != 3 {
+		if len(splitV) != 4 {
 			return nil, nil, fmt.Errorf("unexpected entitlement ID format while processing page grant: %s", entitlement.Id)
 		}
 		accessLevel := splitV[len(splitV)-1]
@@ -361,7 +360,7 @@ func (s *pageSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.A
 		}
 
 		splitV := strings.Split(grant.Entitlement.Id, ":")
-		if len(splitV) != 3 {
+		if len(splitV) != 4 {
 			return nil, fmt.Errorf("unexpected entitlement ID format while processing page grant: %s", grant.Entitlement.Id)
 		}
 		accessLevel := splitV[len(splitV)-1]
