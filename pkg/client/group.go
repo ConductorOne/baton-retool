@@ -291,7 +291,8 @@ func (c *Client) CreateGroup(ctx context.Context, organizationID *int64, name st
 
 	args := []interface{}{name, organizationID}
 
-	if _, err := c.db.Exec(ctx, `INSERT INTO groups ("name", "organizationId", "createdAt", "updatedAt", "archivedAt", "usageAnalyticsAccess", "themeAccess", "unpublishedReleaseAccess", "accountDetailsAccess") VALUES ($1, $2,NOW(), NOW(), NULL, false, false, false, false)`, args...); err != nil {
+	if _, err := c.db.Exec(ctx, `INSERT INTO groups ("name", "organizationId", "createdAt", "updatedAt") 
+		VALUES ($1, $2, NOW(), NOW())`, args...); err != nil {
 		return err
 	}
 
