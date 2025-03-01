@@ -1,8 +1,8 @@
 module github.com/conductorone/baton-retool
 
-go 1.22.10
+go 1.23
 
-toolchain go1.23.5
+toolchain go1.23.6
 
 require (
 	github.com/conductorone/baton-sdk v0.2.66
