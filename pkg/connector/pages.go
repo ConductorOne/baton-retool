@@ -197,9 +197,10 @@ func (s *pageSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *
 				},
 			}
 
-			newGrant := grant.NewGrant(resource, fmt.Sprintf("%s:%s", "group", level), groupId, grant.WithAnnotation(grantExpandable))
+			newGroupGrant := grant.NewGrant(resource, fmt.Sprintf("%s:%s", "group", level), groupId, grant.WithAnnotation(grantExpandable))
+			newUserGrant := grant.NewGrant(resource, fmt.Sprintf("%s:%s", "user", level), groupId, grant.WithAnnotation(grantExpandable))
 
-			ret = append(ret, newGrant)
+			ret = append(ret, newGroupGrant, newUserGrant)
 		}
 
 		bag.Pop()
