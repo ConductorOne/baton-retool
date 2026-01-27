@@ -33,4 +33,4 @@ var configurationFields = []field.SchemaField{
 
 var configRelations = []field.SchemaFieldRelationship{}
 
-var configuration = field.NewConfiguration(configurationFields, configRelations...)
+var configuration = field.NewConfiguration(configurationFields, field.WithConstraints(configRelations...))

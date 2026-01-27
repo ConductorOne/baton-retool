@@ -7,6 +7,7 @@ import (
 
 	configschema "github.com/conductorone/baton-sdk/pkg/config"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/connectorrunner"
 	"github.com/conductorone/baton-sdk/pkg/types"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/spf13/viper"
@@ -20,7 +21,9 @@ var version = "dev"
 func main() {
 	ctx := context.Background()
 
-	_, cmd, err := configschema.DefineConfiguration(ctx, "baton-retool", getConnector, configuration)
+	_, cmd, err := configschema.DefineConfiguration(ctx, "baton-retool", getConnector, configuration,
+		connectorrunner.WithDefaultCapabilitiesConnectorBuilder(&connector.ConnectorImpl{}),
+	)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)

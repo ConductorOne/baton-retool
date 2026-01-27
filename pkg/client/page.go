@@ -78,7 +78,7 @@ func (c *Client) ListPagesForOrg(ctx context.Context, orgID int64, pager *Pager)
 
 	if orgID != 0 {
 		args = append(args, orgID)
-		_, _ = sb.WriteString(fmt.Sprintf(`AND "organizationId"=$%d `, len(args)))
+		fmt.Fprintf(sb, `AND "organizationId"=$%d `, len(args))
 	} else {
 		_, _ = sb.WriteString(`AND "organizationId" IS NULL `)
 	}
@@ -86,11 +86,11 @@ func (c *Client) ListPagesForOrg(ctx context.Context, orgID int64, pager *Pager)
 	_, _ = sb.WriteString(`ORDER BY "id" `)
 
 	args = append(args, limit+1)
-	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
+	fmt.Fprintf(sb, "LIMIT $%d ", len(args))
 
 	if offset > 0 {
 		args = append(args, offset)
-		_, _ = sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
+		fmt.Fprintf(sb, "OFFSET $%d", len(args))
 	}
 
 	var ret []*PageModel
