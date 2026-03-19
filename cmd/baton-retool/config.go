@@ -22,6 +22,10 @@ var (
 		"skip-disabled-users",
 		field.WithDescription("Skip syncing disabled users"),
 	)
+	OrganizationID = field.StringField(
+		"organization-id",
+		field.WithDescription("Restrict sync to a single Retool organization by its numeric ID"),
+	)
 )
 
 var configurationFields = []field.SchemaField{
@@ -29,6 +33,7 @@ var configurationFields = []field.SchemaField{
 	SkipPages,
 	SkipResources,
 	SkipDisabledUsers,
+	OrganizationID,
 }
 
 var configRelations = []field.SchemaFieldRelationship{}
