@@ -5,14 +5,19 @@ import (
 )
 
 var (
-	ConnectionString = field.StringField(
-		"connection-string",
+	APIToken = field.StringField(
+		"api-token",
 		field.WithRequired(true),
-		field.WithDescription("The connection string for connecting to retool database"),
+		field.WithDescription("The Retool API access token (Bearer token)"),
+	)
+	APIURL = field.StringField(
+		"api-url",
+		field.WithRequired(true),
+		field.WithDescription("The base URL of the Retool instance (e.g., https://myorg.retool.com)"),
 	)
 	SkipPages = field.BoolField(
 		"skip-pages",
-		field.WithDescription("Skip syncing pages"),
+		field.WithDescription("Skip syncing apps/pages"),
 	)
 	SkipResources = field.BoolField(
 		"skip-resources",
@@ -20,12 +25,13 @@ var (
 	)
 	SkipDisabledUsers = field.BoolField(
 		"skip-disabled-users",
-		field.WithDescription("Skip syncing disabled users"),
+		field.WithDescription("Skip syncing disabled/inactive users"),
 	)
 )
 
 var configurationFields = []field.SchemaField{
-	ConnectionString,
+	APIToken,
+	APIURL,
 	SkipPages,
 	SkipResources,
 	SkipDisabledUsers,

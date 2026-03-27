@@ -2,108 +2,107 @@ package client
 
 import (
 	"context"
-	"database/sql"
-	"errors"
+	"encoding/json"
+	"fmt"
 	"strconv"
-	"strings"
-	"time"
-
-	"github.com/georgysavva/scany/pgxscan"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"go.uber.org/zap"
 )
 
 type UserModel struct {
-	ID              int64      `db:"id"`
-	Email           string     `db:"email"`
-	FirstName       *string    `db:"firstName"`
-	LastName        *string    `db:"lastName"`
-	ProfilePhotoURL *string    `db:"profilePhotoUrl"`
-	UserName        *string    `db:"userName"`
-	Enabled         bool       `db:"enabled"`
-	LastLoggedIn    *time.Time `db:"lastLoggedIn"`
-	OrganizationID  int64      `db:"organizationId"`
+	ID        json.Number `json:"id"`
+	Email     string      `json:"email"`
+	FirstName string      `json:"first_name"`
+	LastName  string      `json:"last_name"`
+	Active    bool        `json:"active"`
+	CreatedAt string      `json:"created_at"`
+	LastActive string     `json:"last_active"`
+}
+
+func (u *UserModel) GetID() int64 {
+	id, _ := u.ID.Int64()
+	return id
 }
 
 func (u *UserModel) GetFirstName() string {
-	if u != nil && u.FirstName != nil {
-		return *u.FirstName
-	}
-
-	return ""
+	return u.FirstName
 }
 
 func (u *UserModel) GetLastName() string {
-	if u != nil && u.LastName != nil {
-		return *u.LastName
-	}
-
-	return ""
+	return u.LastName
 }
 
-func (u *UserModel) GetProfilePhotoUrl() string {
-	if u != nil && u.ProfilePhotoURL != nil {
-		return *u.ProfilePhotoURL
-	}
-
-	return ""
-}
-
-func (u *UserModel) GetUserName() string {
-	if u != nil && u.UserName != nil {
-		return *u.UserName
-	}
-
-	return ""
-}
-
-func (u *UserModel) GetLastLoggedIn() time.Time {
-	if u != nil && u.LastLoggedIn != nil {
-		return *u.LastLoggedIn
-	}
-
-	return time.Time{}
-}
-
-func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager, skipDisabledUsers bool) ([]*UserModel, string, error) {
-	l := ctxzap.Extract(ctx)
-	l.Debug("listing users for org", zap.Int64("org_id", orgID))
-
+func (c *Client) ListUsers(ctx context.Context, pager *Pager, skipDisabledUsers bool) ([]*UserModel, string, error) {
 	offset, limit, err := pager.Parse()
 	if err != nil {
 		return nil, "", err
 	}
-	var args []interface{}
 
-	sb := &strings.Builder{}
-	_, _ = sb.WriteString(`SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" from users WHERE "organizationId"=$1 `)
-	args = append(args, orgID)
-	if skipDisabledUsers {
-		_, _ = sb.WriteString("AND enabled = true ")
-	}
-	_, _ = sb.WriteString(`ORDER BY "id" `)
-	_, _ = sb.WriteString("LIMIT $2 ")
-	args = append(args, limit+1)
-	if offset > 0 {
-		_, _ = sb.WriteString("OFFSET $3")
-		args = append(args, offset)
-	}
-
-	var ret []*UserModel
-	err = pgxscan.Select(ctx, c.db, &ret, sb.String(), args...)
+	q := listQuery(offset, limit)
+	data, err := c.doRequest(ctx, "GET", "/users", q, nil)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, "", nil
+		return nil, "", fmt.Errorf("baton-retool: failed to list users: %w", err)
+	}
+
+	var resp ListResponse[*UserModel]
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, "", fmt.Errorf("baton-retool: failed to decode users response: %w", err)
+	}
+
+	var users []*UserModel
+	for _, u := range resp.Data {
+		if skipDisabledUsers && !u.Active {
+			continue
 		}
-		return nil, "", err
+		users = append(users, u)
 	}
 
 	var nextPageToken string
-	if len(ret) > limit {
-		offset += limit
-		nextPageToken = strconv.Itoa(offset)
-		ret = ret[:limit]
+	if resp.HasMore {
+		nextPageToken = strconv.Itoa(offset + limit)
 	}
 
-	return ret, nextPageToken, nil
+	return users, nextPageToken, nil
+}
+
+func (c *Client) GetUser(ctx context.Context, userID string) (*UserModel, error) {
+	data, err := c.doRequest(ctx, "GET", fmt.Sprintf("/users/%s", userID), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("baton-retool: failed to get user: %w", err)
+	}
+
+	var resp SingleResponse[*UserModel]
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("baton-retool: failed to decode user response: %w", err)
+	}
+
+	return resp.Data, nil
+}
+
+type CreateUserRequest struct {
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Email     string `json:"email"`
+	Active    bool   `json:"active"`
+}
+
+func (c *Client) CreateUser(ctx context.Context, req *CreateUserRequest) (*UserModel, error) {
+	data, err := c.doRequest(ctx, "POST", "/users", nil, req)
+	if err != nil {
+		return nil, fmt.Errorf("baton-retool: failed to create user: %w", err)
+	}
+
+	var resp SingleResponse[*UserModel]
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("baton-retool: failed to decode create user response: %w", err)
+	}
+
+	return resp.Data, nil
+}
+
+func (c *Client) DeleteUser(ctx context.Context, userID string) error {
+	_, err := c.doRequest(ctx, "DELETE", fmt.Sprintf("/users/%s", userID), nil, nil)
+	if err != nil {
+		return fmt.Errorf("baton-retool: failed to delete user: %w", err)
+	}
+
+	return nil
 }
