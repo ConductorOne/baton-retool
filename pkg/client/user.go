@@ -8,13 +8,13 @@ import (
 )
 
 type UserModel struct {
-	ID        json.Number `json:"id"`
-	Email     string      `json:"email"`
-	FirstName string      `json:"first_name"`
-	LastName  string      `json:"last_name"`
-	Active    bool        `json:"active"`
-	CreatedAt string      `json:"created_at"`
-	LastActive string     `json:"last_active"`
+	ID         json.Number `json:"id"`
+	Email      string      `json:"email"`
+	FirstName  string      `json:"first_name"`
+	LastName   string      `json:"last_name"`
+	Active     bool        `json:"active"`
+	CreatedAt  string      `json:"created_at"`
+	LastActive string      `json:"last_active"`
 }
 
 func (u *UserModel) GetID() int64 {

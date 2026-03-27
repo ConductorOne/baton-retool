@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/conductorone/baton-retool/pkg/client"
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	rs "github.com/conductorone/baton-sdk/pkg/types/resource"
 	"github.com/conductorone/baton-sdk/pkg/types/grant"
+	rs "github.com/conductorone/baton-sdk/pkg/types/resource"
+
+	"github.com/conductorone/baton-retool/pkg/client"
 )
 
 var resourceTypeResource = &v2.ResourceType{
