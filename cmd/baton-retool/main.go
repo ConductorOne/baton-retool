@@ -38,12 +38,13 @@ func main() {
 func getConnector(ctx context.Context, v *viper.Viper) (types.ConnectorServer, error) {
 	l := ctxzap.Extract(ctx)
 
-	connString := v.GetString(ConnectionString.FieldName)
+	apiToken := v.GetString(APIToken.FieldName)
+	apiURL := v.GetString(APIURL.FieldName)
 	skipPages := v.GetBool(SkipPages.FieldName)
 	skipResources := v.GetBool(SkipResources.FieldName)
 	skipDisabledUsers := v.GetBool(SkipDisabledUsers.FieldName)
 
-	cb, err := connector.New(ctx, connString, skipPages, skipResources, skipDisabledUsers)
+	cb, err := connector.New(ctx, apiURL, apiToken, skipPages, skipResources, skipDisabledUsers)
 	if err != nil {
 		l.Error("error creating connector builder", zap.Error(err))
 		return nil, err
