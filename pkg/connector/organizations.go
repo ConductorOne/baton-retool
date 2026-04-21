@@ -25,6 +25,7 @@ type orgSyncer struct {
 	skipPages         bool
 	skipResources     bool
 	skipDisabledUsers bool
+	organizationID    *int64
 }
 
 func (s *orgSyncer) ResourceType(ctx context.Context) *v2.ResourceType {
@@ -38,7 +39,7 @@ func (s *orgSyncer) List(
 ) ([]*v2.Resource, string, annotations.Annotations, error) {
 	var annos annotations.Annotations
 
-	orgs, nextPageToken, err := s.client.ListOrganizations(ctx, &client.Pager{Token: pToken.Token, Size: pToken.Size})
+	orgs, nextPageToken, err := s.client.ListOrganizations(ctx, &client.Pager{Token: pToken.Token, Size: pToken.Size}, s.organizationID)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -282,12 +283,13 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 	return ret, nextPageToken, nil, nil
 }
 
-func newOrgSyncer(ctx context.Context, c *client.Client, skipPages bool, skipResources bool, skipDisabledUsers bool) *orgSyncer {
+func newOrgSyncer(ctx context.Context, c *client.Client, skipPages bool, skipResources bool, skipDisabledUsers bool, organizationID *int64) *orgSyncer {
 	return &orgSyncer{
 		resourceType:      resourceTypeOrg,
 		client:            c,
 		skipPages:         skipPages,
 		skipResources:     skipResources,
 		skipDisabledUsers: skipDisabledUsers,
+		organizationID:    organizationID,
 	}
 }
