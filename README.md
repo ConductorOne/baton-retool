@@ -1,7 +1,19 @@
 # baton-retool
-`baton-retool` is a connector for [Retool](https://retool.com/) built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It connects directly to your primary Retool Postgres database and syncs data about users, groups, organizations, pages, and resources.
+`baton-retool` is a connector for [Retool](https://retool.com/) built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It connects directly to your primary Retool Postgres database and syncs data about users, groups, organizations, pages, and resources. It can also provision and deprovision Retool user accounts via the Retool REST API.
 
 Check out [Baton](https://github.com/conductorone/baton) to learn more the project in general.
+
+## Capabilities
+
+| Capability | Status |
+|------------|--------|
+| Sync (users, groups, organizations, pages, resources) | Yes |
+| Provisioning (Grant/Revoke) | Yes — group membership and page access |
+| Account Creation | Yes — via the Retool REST API |
+| Account Deletion | Yes — via the Retool REST API (deactivates the account; see note below) |
+| Event Feeds | No |
+
+> **Note on account deletion:** Retool's REST API has no hard delete. Deprovisioning **deactivates** the user (blocks sign-in) and keeps their group memberships; the account can be reactivated in Retool. Account provisioning requires the `retool-api-base-url` and `retool-api-token` settings; sync and group/page provisioning need only the `connection-string`.
 
 # Getting Started
 
@@ -31,6 +43,27 @@ GRANT DELETE ON user_groups TO baton;
 ```bash
 BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" baton-retool
 ```
+
+4. (Optional) To enable account provisioning/deprovisioning, create a Retool API token (**Settings → API**) with the `users:read` and `users:write` scopes, then also set the REST configuration. Both fields are required together; omit them for sync-only deployments.
+```bash
+BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" \
+BATON_RETOOL_API_BASE_URL="https://your-org.retool.com" \
+BATON_RETOOL_API_TOKEN="retool_xxxxxxxx" \
+baton-retool --provisioning
+```
+
+## Configuration
+
+| Flag | Env Var | Required | Description |
+|------|---------|----------|-------------|
+| `--connection-string` | `BATON_CONNECTION_STRING` | Yes | Postgres DSN for the Retool database |
+| `--retool-api-base-url` | `BATON_RETOOL_API_BASE_URL` | No* | Retool REST base URL (e.g. `https://your-org.retool.com`) — required for account provisioning |
+| `--retool-api-token` | `BATON_RETOOL_API_TOKEN` | No* | Retool API token (`users:read` + `users:write`) — required for account provisioning |
+| `--skip-pages` | `BATON_SKIP_PAGES` | No | Skip syncing pages |
+| `--skip-resources` | `BATON_SKIP_RESOURCES` | No | Skip syncing resources |
+| `--skip-disabled-users` | `BATON_SKIP_DISABLED_USERS` | No | Skip syncing disabled users |
+
+\* `retool-api-base-url` and `retool-api-token` are required together (both or neither).
 
 ## brew
 
@@ -87,20 +120,22 @@ Available Commands:
   help               Help about any command
 
 Flags:
-      --client-id string           The client ID used to authenticate with ConductorOne ($BATON_CLIENT_ID)
-      --client-secret string       The client secret used to authenticate with ConductorOne ($BATON_CLIENT_SECRET)
-      --connection-string string   required: The connection string for connecting to retool database ($BATON_CONNECTION_STRING)
-  -f, --file string                The path to the c1z file to sync with ($BATON_FILE) (default "sync.c1z")
-  -h, --help                       help for baton-retool
-      --log-format string          The output format for logs: json, console ($BATON_LOG_FORMAT) (default "json")
-      --log-level string           The log level: debug, info, warn, error ($BATON_LOG_LEVEL) (default "info")
-  -p, --provisioning               This must be set in order for provisioning actions to be enabled ($BATON_PROVISIONING)
-      --skip-disabled-users        Skip syncing disabled users ($BATON_SKIP_DISABLED_USERS)
-      --skip-full-sync             This must be set to skip a full sync ($BATON_SKIP_FULL_SYNC)
-      --skip-pages                 Skip syncing pages ($BATON_SKIP_PAGES)
-      --skip-resources             Skip syncing resources ($BATON_SKIP_RESOURCES)
-      --ticketing                  This must be set to enable ticketing support ($BATON_TICKETING)
-  -v, --version                    version for baton-retool
+      --client-id string             The client ID used to authenticate with ConductorOne ($BATON_CLIENT_ID)
+      --client-secret string         The client secret used to authenticate with ConductorOne ($BATON_CLIENT_SECRET)
+      --connection-string string     required: The connection string for connecting to retool database ($BATON_CONNECTION_STRING)
+  -f, --file string                  The path to the c1z file to sync with ($BATON_FILE) (default "sync.c1z")
+  -h, --help                         help for baton-retool
+      --log-format string            The output format for logs: json, console ($BATON_LOG_FORMAT) (default "json")
+      --log-level string             The log level: debug, info, warn, error ($BATON_LOG_LEVEL) (default "info")
+  -p, --provisioning                 This must be set in order for provisioning actions to be enabled ($BATON_PROVISIONING)
+      --retool-api-base-url string   Base URL of the Retool REST API, e.g. https://<org>.retool.com. Required only for account provisioning/deprovisioning. ($BATON_RETOOL_API_BASE_URL)
+      --retool-api-token string      Retool API token with users:read + users:write. Required only for account provisioning/deprovisioning. ($BATON_RETOOL_API_TOKEN)
+      --skip-disabled-users          Skip syncing disabled users ($BATON_SKIP_DISABLED_USERS)
+      --skip-full-sync               This must be set to skip a full sync ($BATON_SKIP_FULL_SYNC)
+      --skip-pages                   Skip syncing pages ($BATON_SKIP_PAGES)
+      --skip-resources               Skip syncing resources ($BATON_SKIP_RESOURCES)
+      --ticketing                    This must be set to enable ticketing support ($BATON_TICKETING)
+  -v, --version                      version for baton-retool
 
 Use "baton-retool [command] --help" for more information about a command.
 ```

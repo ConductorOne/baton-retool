@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
@@ -30,6 +31,44 @@ func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, er
 	return &v2.ConnectorMetadata{
 		DisplayName: "retool",
 		Description: "Retool connector",
+		// Drives the form ConductorOne renders when provisioning a new account. Field
+		// keys must match what userSyncer.CreateAccount reads from AccountInfo.Profile.
+		AccountCreationSchema: &v2.ConnectorAccountCreationSchema{
+			FieldMap: map[string]*v2.ConnectorAccountCreationSchema_Field{
+				"email": {
+					DisplayName: "Email",
+					Required:    true,
+					Description: "Email address of the user.",
+					Placeholder: "email@example.com",
+					Order:       1,
+					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
+				},
+				"first_name": {
+					DisplayName: "First Name",
+					Required:    true,
+					Description: "First name of the user.",
+					Placeholder: "First Name",
+					Order:       2,
+					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
+				},
+				"last_name": {
+					DisplayName: "Last Name",
+					Required:    true,
+					Description: "Last name of the user.",
+					Placeholder: "Last Name",
+					Order:       3,
+					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
+				},
+				"user_type": {
+					DisplayName: "User Type",
+					Required:    false,
+					Description: "Retool user type: \"default\" (full platform user, billable) or \"endUser\". Defaults to \"default\".",
+					Placeholder: "default",
+					Order:       4,
+					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
+				},
+			},
+		},
 	}, nil
 }
 
@@ -38,6 +77,14 @@ func (c *ConnectorImpl) Validate(ctx context.Context) (annotations.Annotations, 
 	if err != nil {
 		return nil, err
 	}
+
+	// Probe the REST surface only when it is configured (sync-only deployments skip it).
+	if c.client.RESTEnabled() {
+		if err := c.client.ValidateREST(ctx); err != nil {
+			return nil, fmt.Errorf("retool REST API validation failed: %w", err)
+		}
+	}
+
 	return nil, nil
 }
 
@@ -63,8 +110,8 @@ func (c *ConnectorImpl) ResourceSyncers(ctx context.Context) []connectorbuilder.
 	return syncers
 }
 
-func New(ctx context.Context, dsn string, skipPages bool, skipResources bool, skipDisabledUsers bool) (*ConnectorImpl, error) {
-	c, err := client.New(ctx, dsn)
+func New(ctx context.Context, dsn string, skipPages bool, skipResources bool, skipDisabledUsers bool, apiBaseURL string, apiToken string) (*ConnectorImpl, error) {
+	c, err := client.New(ctx, dsn, apiBaseURL, apiToken)
 	if err != nil {
 		return nil, err
 	}

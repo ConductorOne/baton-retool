@@ -20,6 +20,15 @@ func formatGroupObjectID(id int64) string {
 	return fmt.Sprintf("%d", id)
 }
 
+// stringFromProfile reads a string value from an AccountInfo profile map, tolerating
+// absent or non-string values.
+func stringFromProfile(profile map[string]interface{}, key string) string {
+	if v, ok := profile[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func parseGroupObjectID(id string) (int64, error) {
 	return strconv.ParseInt(id, 10, 64)
 }
