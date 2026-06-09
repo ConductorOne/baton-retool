@@ -73,15 +73,13 @@ func (e *RetoolErrorResponse) Message() string {
 }
 
 // doRequest is the single REST chokepoint: bearer auth, JSON in/out, and a typed error
-// body. It returns the raw *http.Response so callers can branch on status (e.g. delete
-// idempotency). Per repo convention it returns raw errors — the connector layer wraps.
-func (r *restClient) doRequest(ctx context.Context, method, path string, query url.Values, body, out interface{}) (*http.Response, error) {
-	u := url.URL{
-		Scheme:   r.baseURL.Scheme,
-		Host:     r.baseURL.Host,
-		Path:     path,
-		RawQuery: query.Encode(),
-	}
+// body. It returns the HTTP status code so callers can branch on it (e.g. delete
+// idempotency) without leaking the *http.Response. Per repo convention it returns raw
+// errors — the connector layer wraps.
+func (r *restClient) doRequest(ctx context.Context, method, endpoint string, query url.Values, body, out interface{}) (int, error) {
+	// JoinPath preserves any base-URL path prefix (e.g. a reverse proxy at /retool).
+	u := r.baseURL.JoinPath(endpoint)
+	u.RawQuery = query.Encode()
 
 	reqOpts := []uhttp.RequestOption{
 		uhttp.WithBearerToken(r.token),
@@ -91,9 +89,9 @@ func (r *restClient) doRequest(ctx context.Context, method, path string, query u
 		reqOpts = append(reqOpts, uhttp.WithJSONBody(body))
 	}
 
-	req, err := r.httpClient.NewRequest(ctx, method, &u, reqOpts...)
+	req, err := r.httpClient.NewRequest(ctx, method, u, reqOpts...)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	var errResp RetoolErrorResponse
@@ -102,7 +100,14 @@ func (r *restClient) doRequest(ctx context.Context, method, path string, query u
 		doOpts = append(doOpts, uhttp.WithJSONResponse(out))
 	}
 
-	return r.httpClient.Do(req, doOpts...)
+	resp, err := r.httpClient.Do(req, doOpts...)
+	if resp != nil {
+		// uhttp already drained, closed, and replaced the body with a no-op closer;
+		// closing again is harmless and satisfies the bodyclose linter.
+		defer resp.Body.Close()
+		return resp.StatusCode, err
+	}
+	return 0, err
 }
 
 // ValidateREST cheaply confirms the REST token + base URL work (used by Validate()).
@@ -120,14 +125,9 @@ func (c *Client) ValidateREST(ctx context.Context) error {
 // email (HTTP 409) so the caller can resolve and return the existing account.
 func (c *Client) CreateUser(ctx context.Context, params CreateUserParams) (*RESTUser, error) {
 	var out userResponse
-	resp, err := c.rest.doRequest(ctx, http.MethodPost, usersEndpoint, nil, createUserRequest{
-		Email:     params.Email,
-		FirstName: params.FirstName,
-		LastName:  params.LastName,
-		UserType:  params.UserType,
-	}, &out)
+	status, err := c.rest.doRequest(ctx, http.MethodPost, usersEndpoint, nil, createUserRequest(params), &out)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusConflict {
+		if status == http.StatusConflict {
 			return nil, ErrUserAlreadyExists
 		}
 		return nil, err
@@ -164,15 +164,13 @@ func (c *Client) GetUserByEmail(ctx context.Context, email string) (*RESTUser, e
 // the user). Idempotent: a missing user (404) or an already-deactivated one (422) both
 // return their sentinels so the caller can treat them as success.
 func (c *Client) DeleteUser(ctx context.Context, sid string) error {
-	resp, err := c.rest.doRequest(ctx, http.MethodDelete, fmt.Sprintf(userByIDEndpoint, sid), nil, nil, nil)
+	status, err := c.rest.doRequest(ctx, http.MethodDelete, fmt.Sprintf(userByIDEndpoint, sid), nil, nil, nil)
 	if err != nil {
-		if resp != nil {
-			switch resp.StatusCode {
-			case http.StatusNotFound:
-				return ErrUserNotFound
-			case http.StatusUnprocessableEntity:
-				return ErrUserAlreadyDisabled
-			}
+		switch status {
+		case http.StatusNotFound:
+			return ErrUserNotFound
+		case http.StatusUnprocessableEntity:
+			return ErrUserAlreadyDisabled
 		}
 		return err
 	}

@@ -32,6 +32,9 @@ var (
 	RetoolAPIToken = field.StringField(
 		"retool-api-token",
 		field.WithDescription("Retool API token with users:read + users:write. Required only for account provisioning/deprovisioning."),
+		// This SDK version predates field.WithIsSecret; WithHidden keeps the bearer
+		// token out of --help output and config dumps.
+		field.WithHidden(true),
 	)
 )
 
