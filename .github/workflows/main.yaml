@@ -14,9 +14,12 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Run linters
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          skip-cache: true
+          # Pinned so lint findings don't drift with new golangci-lint releases.
+          # Bump deliberately, fixing any new findings in the same PR.
+          version: v2.11.1
           args: --timeout=3m
   go-test:
     runs-on: ubuntu-latest
