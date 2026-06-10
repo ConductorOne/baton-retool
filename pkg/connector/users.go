@@ -120,7 +120,7 @@ func (s *userSyncer) CreateAccountCapabilityDetails(ctx context.Context) (*v2.Cr
 func (s *userSyncer) CreateAccount(
 	ctx context.Context,
 	accountInfo *v2.AccountInfo,
-	credentialOptions *v2.CredentialOptions,
+	credentialOptions *v2.LocalCredentialOptions,
 ) (connectorbuilder.CreateAccountResponse, []*v2.PlaintextData, annotations.Annotations, error) {
 	if !s.client.RESTEnabled() {
 		return nil, nil, nil, status.Error(codes.Unavailable, "retool REST API is not configured; set retool-api-base-url and retool-api-token to provision accounts")
@@ -161,12 +161,6 @@ func (s *userSyncer) CreateAccount(
 	return &v2.CreateAccountResponse_SuccessResult{
 		Resource: resource,
 	}, nil, nil, nil
-}
-
-// Create satisfies the ResourceManager interface (required alongside Delete) but resource
-// creation is not supported — accounts are provisioned via CreateAccount.
-func (s *userSyncer) Create(ctx context.Context, resource *v2.Resource) (*v2.Resource, annotations.Annotations, error) {
-	return nil, nil, status.Error(codes.Unimplemented, "creating user resources directly is not supported; use account provisioning")
 }
 
 // Delete deprovisions a Retool user. Retool's DELETE is a soft delete (it deactivates the

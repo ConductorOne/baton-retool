@@ -9,20 +9,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"time"
 
-	"github.com/conductorone/baton-sdk/pkg/field"
-	"github.com/conductorone/baton-sdk/pkg/logging"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 	"gopkg.in/yaml.v2"
+
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"github.com/spf13/cobra"
+
+	"github.com/conductorone/baton-sdk/pkg/field"
+	"github.com/conductorone/baton-sdk/pkg/logging"
 )
 
 const (
@@ -62,12 +63,6 @@ var skipServiceSetupFields = map[string]struct{}{
 	"RevokeGrantID":      {},
 }
 
-var (
-	stringReflectType      = reflect.TypeOf("")
-	boolReflectType        = reflect.TypeOf(true)
-	stringSliceReflectType = reflect.TypeOf([]string(nil))
-)
-
 func getExePath() (string, error) {
 	p, err := filepath.Abs(os.Args[0])
 	if err != nil {
@@ -98,11 +93,12 @@ func getExePath() (string, error) {
 
 func initLogger(ctx context.Context, name string, loggingOpts ...logging.Option) (context.Context, error) {
 	if isService() {
-		loggingOpts = []logging.Option{
+		defaultLoggingOpts := []logging.Option{
 			logging.WithLogFormat(logging.LogFormatJSON),
 			logging.WithLogLevel("info"),
 			logging.WithOutputPaths([]string{filepath.Join(getConfigDir(name), "baton.log")}),
 		}
+		loggingOpts = append(defaultLoggingOpts, loggingOpts...)
 	}
 
 	return logging.Init(ctx, loggingOpts...)
@@ -303,18 +299,18 @@ func interactiveSetup(ctx context.Context, outputFilePath string, fields []field
 			continue
 		}
 
-		switch vfield.GetType() {
-		case reflect.Bool:
+		switch vfield.Variant {
+		case field.BoolVariant:
 			b, err := strconv.ParseBool(input)
 			if err != nil {
 				return err
 			}
 			config[vfield.GetName()] = b
 
-		case reflect.String:
+		case field.StringVariant:
 			config[vfield.GetName()] = input
 
-		case reflect.Int:
+		case field.IntVariant:
 			i, err := strconv.Atoi(input)
 			if err != nil {
 				return err
@@ -324,7 +320,7 @@ func interactiveSetup(ctx context.Context, outputFilePath string, fields []field
 
 			// TODO (shackra): add support for []string in SDK
 		default:
-			l.Error("Unsupported type for interactive config.", zap.String("type", vfield.GetType().String()))
+			l.Error("Unsupported type for interactive config.", zap.String("type", string(vfield.Variant)))
 			return errors.New("unsupported type for interactive config")
 		}
 	}
@@ -348,12 +344,29 @@ func interactiveSetup(ctx context.Context, outputFilePath string, fields []field
 		l.Error("Failed to create config file.", zap.Error(err))
 		return err
 	}
-	defer f.Close()
+	fClosed := false
+	defer func() {
+		if !fClosed {
+			_ = f.Close()
+		}
+	}()
 
 	err = yaml.NewEncoder(f).Encode(config)
 	if err != nil {
 		return err
 	}
+
+	// Sync + Close + err-check before logging success. Without this
+	// the deferred Close would silently discard any write-back error
+	// (out-of-disk, IO error) and the user would see "Config file
+	// created." for a torn config they then try to load.
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync config file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to close config file: %w", err)
+	}
+	fClosed = true
 
 	l.Info("Config file created.", zap.String("path", outputFilePath))
 

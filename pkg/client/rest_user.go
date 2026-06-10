@@ -14,7 +14,7 @@ import (
 // Paths are addressed by the user `sid` (user_<uuid>), surfaced over REST as `id`.
 const (
 	usersEndpoint    = "/api/v2/users"    // POST create, GET ?email= lookup
-	userByIDEndpoint = "/api/v2/users/%s" // PATCH (disable/enable), DELETE — %s = sid
+	userByIDEndpoint = "/api/v2/users/%s" // DELETE (soft-deactivate) — %s = sid
 )
 
 // Sentinels for the idempotent/conflict states the lifecycle handlers tolerate.

@@ -13,6 +13,7 @@ import (
 	smithyio "github.com/aws/smithy-go/io"
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/ptr"
+	"github.com/aws/smithy-go/tracing"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"io"
 	"strings"
@@ -33,6 +34,10 @@ func (m *awsRestjson1_deserializeOpCreateToken) HandleDeserialize(ctx context.Co
 		return out, metadata, err
 	}
 
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
 	response, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok {
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
@@ -72,6 +77,7 @@ func (m *awsRestjson1_deserializeOpCreateToken) HandleDeserialize(ctx context.Co
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -254,6 +260,10 @@ func (m *awsRestjson1_deserializeOpCreateTokenWithIAM) HandleDeserialize(ctx con
 		return out, metadata, err
 	}
 
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
 	response, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok {
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
@@ -293,6 +303,7 @@ func (m *awsRestjson1_deserializeOpCreateTokenWithIAM) HandleDeserialize(ctx con
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -414,6 +425,11 @@ func awsRestjson1_deserializeOpDocumentCreateTokenWithIAMOutput(v **CreateTokenW
 				sv.AccessToken = ptr.String(jtv)
 			}
 
+		case "awsAdditionalDetails":
+			if err := awsRestjson1_deserializeDocumentAwsAdditionalDetails(&sv.AwsAdditionalDetails, value); err != nil {
+				return err
+			}
+
 		case "expiresIn":
 			if value != nil {
 				jtv, ok := value.(json.Number)
@@ -492,6 +508,10 @@ func (m *awsRestjson1_deserializeOpRegisterClient) HandleDeserialize(ctx context
 		return out, metadata, err
 	}
 
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
 	response, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok {
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
@@ -531,6 +551,7 @@ func (m *awsRestjson1_deserializeOpRegisterClient) HandleDeserialize(ctx context
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -589,6 +610,9 @@ func awsRestjson1_deserializeOpErrorRegisterClient(response *smithyhttp.Response
 
 	case strings.EqualFold("InvalidScopeException", errorCode):
 		return awsRestjson1_deserializeErrorInvalidScopeException(response, errorBody)
+
+	case strings.EqualFold("SlowDownException", errorCode):
+		return awsRestjson1_deserializeErrorSlowDownException(response, errorBody)
 
 	case strings.EqualFold("UnsupportedGrantTypeException", errorCode):
 		return awsRestjson1_deserializeErrorUnsupportedGrantTypeException(response, errorBody)
@@ -711,6 +735,10 @@ func (m *awsRestjson1_deserializeOpStartDeviceAuthorization) HandleDeserialize(c
 		return out, metadata, err
 	}
 
+	_, span := tracing.StartSpan(ctx, "OperationDeserializer")
+	endTimer := startMetricTimer(ctx, "client.call.deserialization_duration")
+	defer endTimer()
+	defer span.End()
 	response, ok := out.RawResponse.(*smithyhttp.Response)
 	if !ok {
 		return out, metadata, &smithy.DeserializationError{Err: fmt.Errorf("unknown transport type %T", out.RawResponse)}
@@ -750,6 +778,7 @@ func (m *awsRestjson1_deserializeOpStartDeviceAuthorization) HandleDeserialize(c
 		}
 	}
 
+	span.End()
 	return out, metadata, err
 }
 
@@ -1456,6 +1485,15 @@ func awsRestjson1_deserializeDocumentAccessDeniedException(v **types.AccessDenie
 				sv.Error_description = ptr.String(jtv)
 			}
 
+		case "reason":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected AccessDeniedExceptionReason to be of type string, got %T instead", value)
+				}
+				sv.Reason = types.AccessDeniedExceptionReason(jtv)
+			}
+
 		default:
 			_, _ = key, value
 
@@ -1503,6 +1541,46 @@ func awsRestjson1_deserializeDocumentAuthorizationPendingException(v **types.Aut
 					return fmt.Errorf("expected ErrorDescription to be of type string, got %T instead", value)
 				}
 				sv.Error_description = ptr.String(jtv)
+			}
+
+		default:
+			_, _ = key, value
+
+		}
+	}
+	*v = sv
+	return nil
+}
+
+func awsRestjson1_deserializeDocumentAwsAdditionalDetails(v **types.AwsAdditionalDetails, value interface{}) error {
+	if v == nil {
+		return fmt.Errorf("unexpected nil of type %T", v)
+	}
+	if value == nil {
+		return nil
+	}
+
+	shape, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected JSON type %v", value)
+	}
+
+	var sv *types.AwsAdditionalDetails
+	if *v == nil {
+		sv = &types.AwsAdditionalDetails{}
+	} else {
+		sv = *v
+	}
+
+	for key, value := range shape {
+		switch key {
+		case "identityContext":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected IdentityContext to be of type string, got %T instead", value)
+				}
+				sv.IdentityContext = ptr.String(jtv)
 			}
 
 		default:
@@ -1846,6 +1924,15 @@ func awsRestjson1_deserializeDocumentInvalidRequestException(v **types.InvalidRe
 					return fmt.Errorf("expected ErrorDescription to be of type string, got %T instead", value)
 				}
 				sv.Error_description = ptr.String(jtv)
+			}
+
+		case "reason":
+			if value != nil {
+				jtv, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("expected InvalidRequestExceptionReason to be of type string, got %T instead", value)
+				}
+				sv.Reason = types.InvalidRequestExceptionReason(jtv)
 			}
 
 		default:
