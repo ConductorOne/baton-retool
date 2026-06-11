@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Exercise account provisioning end-to-end against the local Retool stack:
-#   create -> verify -> delete (deactivate) -> verify -> duplicate-delete (idempotency).
+# Exercise the account lifecycle end-to-end against the local Retool stack:
+#   create -> verify -> disable_user action -> verify -> enable_user action -> verify
+#   -> duplicate disable (idempotency).
+#
+# Retool's REST API has no hard delete, so the connector models deprovisioning as the
+# reversible enable_user/disable_user actions (PATCH /active) instead of Delete.
 #
 # Requires (set by the workflow): BATON_CONNECTION_STRING, BATON_RETOOL_API_BASE_URL,
 # BATON_RETOOL_API_TOKEN. Run from the repo root with ./baton-retool already built.
@@ -29,13 +33,25 @@ LID="$(echo "$RESP" | sed -E 's/.*"legacy_id":([0-9]+).*/\1/')"
 [ -n "$LID" ] || fail "could not resolve legacy_id"
 echo "    legacy_id=$LID"
 
-echo "==> delete (deactivate) u$LID"
-"$CONNECTOR" --provisioning --file "$C1Z" --delete-resource="u$LID" --delete-resource-type=user
+echo "==> disable_user action on u$LID"
+"$CONNECTOR" --provisioning --file "$C1Z" \
+  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
 
-echo "==> verify the account is deactivated (Retool delete is a soft-disable)"
-echo "$(lookup)" | grep -q '"active":false' || fail "account was not deactivated after delete"
+echo "==> verify the account is deactivated"
+echo "$(lookup)" | grep -q '"active":false' || fail "account was not deactivated by disable_user"
 
-echo "==> duplicate delete must be idempotent (success, not error)"
-"$CONNECTOR" --provisioning --file "$C1Z" --delete-resource="u$LID" --delete-resource-type=user
+echo "==> enable_user action on u$LID"
+"$CONNECTOR" --provisioning --file "$C1Z" \
+  --invoke-action enable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
 
-echo "PASS: account provisioning create -> delete -> dup-delete all succeeded"
+echo "==> verify the account is active again"
+echo "$(lookup)" | grep -q '"active":true' || fail "account was not reactivated by enable_user"
+
+echo "==> duplicate disable must be idempotent (success, not error)"
+"$CONNECTOR" --provisioning --file "$C1Z" \
+  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+"$CONNECTOR" --provisioning --file "$C1Z" \
+  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+echo "$(lookup)" | grep -q '"active":false' || fail "account is not deactivated after duplicate disable"
+
+echo "PASS: account create -> disable -> enable -> dup-disable all succeeded"

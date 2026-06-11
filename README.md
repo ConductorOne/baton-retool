@@ -1,5 +1,5 @@
 # baton-retool
-`baton-retool` is a connector for [Retool](https://retool.com/) built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It connects directly to your primary Retool Postgres database and syncs data about users, groups, organizations, pages, and resources. It can also provision and deprovision Retool user accounts via the Retool REST API.
+`baton-retool` is a connector for [Retool](https://retool.com/) built using the [Baton SDK](https://github.com/conductorone/baton-sdk). It connects directly to your primary Retool Postgres database and syncs data about users, groups, organizations, pages, and resources. It can also create Retool user accounts and enable/disable them via the Retool REST API.
 
 Check out [Baton](https://github.com/conductorone/baton) to learn more the project in general.
 
@@ -10,10 +10,11 @@ Check out [Baton](https://github.com/conductorone/baton) to learn more the proje
 | Sync (users, groups, organizations, pages, resources) | Yes |
 | Provisioning (Grant/Revoke) | Yes — group membership and page access |
 | Account Creation | Yes — via the Retool REST API |
-| Account Deletion | Yes — via the Retool REST API (deactivates the account; see note below) |
+| Account Enable/Disable | Yes — `enable_user` / `disable_user` actions via the Retool REST API |
+| Account Deletion | No — Retool's REST API has no hard delete (see note below) |
 | Event Feeds | No |
 
-> **Note on account deletion:** Retool's REST API has no hard delete. Deprovisioning **deactivates** the user (blocks sign-in) and keeps their group memberships; the account can be reactivated in Retool. Account provisioning requires the `retool-api-base-url` and `retool-api-token` settings; sync and group/page provisioning need only the `connection-string`.
+> **Note on deprovisioning:** Retool's REST API has no hard delete — its `DELETE /users/{id}` endpoint only deactivates the account. The connector therefore models deprovisioning as the reversible **`disable_user`** action (blocks sign-in, keeps group memberships) with **`enable_user`** to reactivate, instead of an account Delete that would misrepresent a deactivation as a removal. Account provisioning requires the `retool-api-base-url` and `retool-api-token` settings; sync and group/page provisioning need only the `connection-string`.
 
 # Getting Started
 
@@ -33,7 +34,7 @@ GRANT SELECT, INSERT, UPDATE ("id", "accessLevel") on group_resource_folder_defa
 GRANT SELECT ("id", "name") ON organizations TO baton;
 GRANT SELECT ("id", "name", "organizationId", "folderId", "photoUrl", "description", "deletedAt") ON pages TO baton;
 GRANT SELECT ("id", "name", "organizationId", "type", "displayName", "environmentId", "resourceFolderId") ON resources TO baton;
-GRANT SELECT ("id", "email", "firstName", "lastName", "profilePhotoUrl", "userName", "enabled", "lastLoggedIn", "organizationId") ON users TO baton;
+GRANT SELECT ("id", "sid", "email", "firstName", "lastName", "profilePhotoUrl", "userName", "enabled", "lastLoggedIn", "organizationId") ON users TO baton;
 GRANT SELECT, INSERT, UPDATE, DELETE ("id", "userId", "groupId", "isAdmin", "updatedAt") ON user_groups TO baton;
 GRANT USAGE, SELECT ON SEQUENCE user_groups_id_seq TO baton;
 GRANT DELETE ON user_groups TO baton;

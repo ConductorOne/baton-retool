@@ -11,8 +11,6 @@ import (
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
 	_ "github.com/georgysavva/scany/pgxscan"
-	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -161,41 +159,6 @@ func (s *userSyncer) CreateAccount(
 	return &v2.CreateAccountResponse_SuccessResult{
 		Resource: resource,
 	}, nil, nil, nil
-}
-
-// Delete deprovisions a Retool user. Retool's DELETE is a soft delete (it deactivates the
-// user). Idempotent: an already-deleted or unknown user is treated as success.
-func (s *userSyncer) Delete(ctx context.Context, resourceId *v2.ResourceId) (annotations.Annotations, error) {
-	l := ctxzap.Extract(ctx)
-
-	if !s.client.RESTEnabled() {
-		return nil, status.Error(codes.Unavailable, "retool REST API is not configured; set retool-api-base-url and retool-api-token to deprovision accounts")
-	}
-
-	legacyID, err := parseObjectID(resourceId.Resource)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid user id %q: %v", resourceId.Resource, err)
-	}
-
-	// Resolve the stable REST sid from the Postgres pool we already hold.
-	sid, err := s.client.GetUserSID(ctx, legacyID)
-	if err != nil {
-		if errors.Is(err, client.ErrUserNotFound) {
-			l.Debug("user already absent from Retool DB, treating delete as success", zap.Int64("legacy_id", legacyID))
-			return nil, nil
-		}
-		return nil, status.Errorf(codes.Internal, "failed to resolve user %d: %v", legacyID, err)
-	}
-
-	if err := s.client.DeleteUser(ctx, sid); err != nil {
-		if errors.Is(err, client.ErrUserNotFound) || errors.Is(err, client.ErrUserAlreadyDisabled) {
-			l.Debug("user already deprovisioned, treating delete as success", zap.String("sid", sid))
-			return nil, nil
-		}
-		return nil, status.Errorf(codes.Internal, "failed to delete user %s: %v", sid, err)
-	}
-
-	return nil, nil
 }
 
 // restUserResource builds a user resource from a REST user, keyed by its Postgres

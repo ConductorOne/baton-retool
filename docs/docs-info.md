@@ -18,18 +18,17 @@ This document provides information needed to set up and use the connector.
 
 Yes.
 
-| Resource | Grant | Revoke | Create | Delete |
-|----------|-------|--------|--------|--------|
-| **Group membership** | ✅ Adds the user to the group (Postgres `user_groups`) | ✅ Removes the user from the group | - | - |
-| **Page (App) access** | ✅ Grants the group an access level on the page | ✅ Removes the group's access | - | - |
-| **Account (User)** | - | - | ✅ Creates/invites a Retool user via the REST API | ✅ Deprovisions the user via the REST API |
+| Resource | Grant | Revoke | Create | Delete | Actions |
+|----------|-------|--------|--------|--------|---------|
+| **Group membership** | ✅ Adds the user to the group (Postgres `user_groups`) | ✅ Removes the user from the group | - | - | - |
+| **Page (App) access** | ✅ Grants the group an access level on the page | ✅ Removes the group's access | - | - | - |
+| **Account (User)** | - | - | ✅ Creates/invites a Retool user via the REST API | - | ✅ `enable_user` / `disable_user` |
 
 **Important behavioral notes:**
 - **Sync and group/page provisioning** run entirely against the Retool **Postgres database** (the `connection-string`). They do not require the REST API.
-- **Account Create/Delete** use the Retool **REST API** (`/api/v2/users`) and require `retool-api-base-url` + `retool-api-token`. These are optional config; when absent, the account-lifecycle handlers fail fast with a clear "REST API not configured" error while sync and grant/revoke keep working.
-- **Account "Delete" is a soft deactivation, not a hard delete.** Retool's REST API has no hard-delete endpoint — `DELETE /api/v2/users/{id}` sets the user to disabled (blocks sign-in), retains group memberships, and is reversible. Re-deleting an already-deactivated user and deleting an unknown user are both treated as success (idempotent).
+- **Account Create and the enable/disable actions** use the Retool **REST API** (`/api/v2/users`) and require `retool-api-base-url` + `retool-api-token`. These are optional config; when absent, the account-lifecycle handlers fail fast with a clear "REST API not configured" error while sync and grant/revoke keep working.
+- **There is no account Delete.** Retool's REST API has no hard-delete endpoint (its `DELETE /api/v2/users/{id}` only deactivates), so the connector deliberately does not expose a Delete that would misrepresent a deactivation as a removal. Deprovisioning is the **`disable_user`** action (`PATCH /api/v2/users/{id}` setting `active=false`): it blocks sign-in, retains group memberships, and is reversible via **`enable_user`**. Both actions take a `user_id` argument (the Baton resource ID, e.g. `u42`) and are idempotent — patching to the current state succeeds.
 - The connector resolves the synced `user:<int64>` (Postgres `id`, exposed as `legacy_id` over REST) to the REST `sid` (`user_<uuid>`) via a direct Postgres lookup — no email-based matching.
-- There is **no enable/disable connector action** (the connector's SDK version predates the action framework); deprovisioning is exposed via account Delete.
 
 ## Connector Credentials
 
@@ -53,7 +52,7 @@ Yes.
 ### Retool Plan Requirements
 
 - **Direct database access** to Retool's primary Postgres DB is generally a **self-hosted Retool** capability (or a managed/peered database you can reach from where the connector runs). This is required for all sync and group/page provisioning.
-- **REST API access** (API tokens) may be gated behind a specific Retool plan/tier. Account provisioning/deprovisioning is only available where the REST API and a `users:read`+`users:write` token are available.
+- **REST API access** (API tokens) may be gated behind a specific Retool plan/tier. Account creation and the enable/disable actions are only available where the REST API and a `users:read`+`users:write` token are available.
 
 ### API Documentation Links
 

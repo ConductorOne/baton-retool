@@ -14,14 +14,11 @@ import (
 // Paths are addressed by the user `sid` (user_<uuid>), surfaced over REST as `id`.
 const (
 	usersEndpoint    = "/api/v2/users"    // POST create, GET ?email= lookup
-	userByIDEndpoint = "/api/v2/users/%s" // DELETE (soft-deactivate) — %s = sid
+	userByIDEndpoint = "/api/v2/users/%s" // PATCH (enable/disable) — %s = sid
 )
 
-// Sentinels for the idempotent/conflict states the lifecycle handlers tolerate.
-var (
-	ErrUserAlreadyExists   = errors.New("user already exists")
-	ErrUserAlreadyDisabled = errors.New("user already disabled")
-)
+// ErrUserAlreadyExists is the idempotent-create sentinel the lifecycle handlers tolerate.
+var ErrUserAlreadyExists = errors.New("user already exists")
 
 // RESTUser is the Retool REST representation of a user. `ID` is the stable `sid`
 // (user_<uuid>); `LegacyID` is the Postgres `users.id` that baton keys `user:<int64>` on.
@@ -160,17 +157,28 @@ func (c *Client) GetUserByEmail(ctx context.Context, email string) (*RESTUser, e
 	}
 }
 
-// DeleteUser deprovisions a user by sid. Retool's DELETE is a soft delete (it deactivates
-// the user). Idempotent: a missing user (404) or an already-deactivated one (422) both
-// return their sentinels so the caller can treat them as success.
-func (c *Client) DeleteUser(ctx context.Context, sid string) error {
-	status, err := c.rest.doRequest(ctx, http.MethodDelete, fmt.Sprintf(userByIDEndpoint, sid), nil, nil, nil)
+// patchOperation is a JSON-Patch operation as accepted by PATCH /api/v2/users/{id}.
+type patchOperation struct {
+	Op    string      `json:"op"`
+	Path  string      `json:"path"`
+	Value interface{} `json:"value"`
+}
+
+type patchUserRequest struct {
+	Operations []patchOperation `json:"operations"`
+}
+
+// SetUserActive enables (active=true) or disables (active=false) a user by sid.
+// Idempotent: patching to the current state succeeds. Retool has no hard delete —
+// this deactivation/reactivation pair is the whole account lifecycle after create.
+func (c *Client) SetUserActive(ctx context.Context, sid string, active bool) error {
+	body := patchUserRequest{
+		Operations: []patchOperation{{Op: "replace", Path: "/active", Value: active}},
+	}
+	status, err := c.rest.doRequest(ctx, http.MethodPatch, fmt.Sprintf(userByIDEndpoint, sid), nil, body, nil)
 	if err != nil {
-		switch status {
-		case http.StatusNotFound:
+		if status == http.StatusNotFound {
 			return ErrUserNotFound
-		case http.StatusUnprocessableEntity:
-			return ErrUserAlreadyDisabled
 		}
 		return err
 	}
