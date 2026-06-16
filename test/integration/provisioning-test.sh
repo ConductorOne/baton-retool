@@ -33,25 +33,29 @@ LID="$(echo "$RESP" | sed -E 's/.*"legacy_id":([0-9]+).*/\1/')"
 [ -n "$LID" ] || fail "could not resolve legacy_id"
 echo "    legacy_id=$LID"
 
+# user_id is a ResourceIdField, so it must be passed as a {resource_type_id, resource_id}
+# struct (mirrors the C1 resource picker), not a bare string.
+USER_ARG="{\"user_id\":{\"resource_type_id\":\"user\",\"resource_id\":\"u$LID\"}}"
+
 echo "==> disable_user action on u$LID"
 "$CONNECTOR" --provisioning --file "$C1Z" \
-  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+  --invoke-action disable_user --invoke-action-args "$USER_ARG"
 
 echo "==> verify the account is deactivated"
 echo "$(lookup)" | grep -q '"active":false' || fail "account was not deactivated by disable_user"
 
 echo "==> enable_user action on u$LID"
 "$CONNECTOR" --provisioning --file "$C1Z" \
-  --invoke-action enable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+  --invoke-action enable_user --invoke-action-args "$USER_ARG"
 
 echo "==> verify the account is active again"
 echo "$(lookup)" | grep -q '"active":true' || fail "account was not reactivated by enable_user"
 
 echo "==> duplicate disable must be idempotent (success, not error)"
 "$CONNECTOR" --provisioning --file "$C1Z" \
-  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+  --invoke-action disable_user --invoke-action-args "$USER_ARG"
 "$CONNECTOR" --provisioning --file "$C1Z" \
-  --invoke-action disable_user --invoke-action-args "{\"user_id\":\"u$LID\"}"
+  --invoke-action disable_user --invoke-action-args "$USER_ARG"
 echo "$(lookup)" | grep -q '"active":false' || fail "account is not deactivated after duplicate disable"
 
 echo "PASS: account create -> disable -> enable -> dup-disable all succeeded"

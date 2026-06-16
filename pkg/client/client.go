@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -89,13 +88,24 @@ func newRESTClient(ctx context.Context, apiBaseURL string, apiToken string) (*re
 		return nil, fmt.Errorf("invalid retool-api-base-url %q: must include scheme and host", apiBaseURL)
 	}
 
-	httpClient, err := uhttp.NewBaseHttpClientWithContext(ctx, &http.Client{Timeout: 30 * time.Second})
+	// uhttp.NewClient builds an *http.Client whose transport emits structured
+	// request/response logs (WithLogger) and applies the timeout; wrapping it gives the
+	// REST surface the same HTTP debug logging as the rest of the SDK.
+	httpClient, err := uhttp.NewClient(ctx,
+		uhttp.WithLogger(true, ctxzap.Extract(ctx)),
+		uhttp.WithTimeout(30*time.Second),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	baseClient, err := uhttp.NewBaseHttpClientWithContext(ctx, httpClient)
 	if err != nil {
 		return nil, err
 	}
 
 	return &restClient{
-		httpClient: httpClient,
+		httpClient: baseClient,
 		baseURL:    base,
 		token:      apiToken,
 	}, nil

@@ -121,21 +121,21 @@ func (s *userSyncer) CreateAccount(
 	credentialOptions *v2.LocalCredentialOptions,
 ) (connectorbuilder.CreateAccountResponse, []*v2.PlaintextData, annotations.Annotations, error) {
 	if !s.client.RESTEnabled() {
-		return nil, nil, nil, status.Error(codes.Unavailable, "retool REST API is not configured; set retool-api-base-url and retool-api-token to provision accounts")
+		return nil, nil, nil, status.Error(codes.Unavailable, "baton-retool: REST API is not configured; set retool-api-base-url and retool-api-token to provision accounts")
 	}
 
 	profile := accountInfo.GetProfile().AsMap()
 	email := stringFromProfile(profile, "email")
 	if email == "" {
-		return nil, nil, nil, status.Error(codes.InvalidArgument, "email is required to create an account")
+		return nil, nil, nil, status.Error(codes.InvalidArgument, "baton-retool: email is required to create an account")
 	}
 	firstName := stringFromProfile(profile, "first_name")
 	lastName := stringFromProfile(profile, "last_name")
 	if firstName == "" || lastName == "" {
-		return nil, nil, nil, status.Error(codes.InvalidArgument, "first_name and last_name are required to create an account")
+		return nil, nil, nil, status.Error(codes.InvalidArgument, "baton-retool: first_name and last_name are required to create an account")
 	}
 
-	user, err := s.client.CreateUser(ctx, client.CreateUserParams{
+	user, annos, err := s.client.CreateUser(ctx, client.CreateUserParams{
 		Email:     email,
 		FirstName: firstName,
 		LastName:  lastName,
@@ -143,22 +143,23 @@ func (s *userSyncer) CreateAccount(
 	})
 	if err != nil {
 		// Idempotent: a user with this email already exists -> return it as success.
+		// Keep the most recent call's rate-limit annotations.
 		if errors.Is(err, client.ErrUserAlreadyExists) {
-			user, err = s.client.GetUserByEmail(ctx, email)
+			user, annos, err = s.client.GetUserByEmail(ctx, email)
 		}
 		if err != nil {
-			return nil, nil, nil, status.Errorf(codes.Internal, "failed to create account for %q: %v", email, err)
+			return nil, nil, annos, status.Errorf(codes.Internal, "baton-retool: failed to create account for %q: %v", email, err)
 		}
 	}
 
 	resource, err := s.restUserResource(user)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, annos, err
 	}
 
 	return &v2.CreateAccountResponse_SuccessResult{
 		Resource: resource,
-	}, nil, nil, nil
+	}, nil, annos, nil
 }
 
 // restUserResource builds a user resource from a REST user, keyed by its Postgres

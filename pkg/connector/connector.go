@@ -29,7 +29,7 @@ type ConnectorImpl struct {
 
 func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, error) {
 	return &v2.ConnectorMetadata{
-		DisplayName: "retool",
+		DisplayName: "Retool",
 		Description: "Retool connector",
 		// Drives the form ConductorOne renders when provisioning a new account. Field
 		// keys must match what userSyncer.CreateAccount reads from AccountInfo.Profile.
@@ -80,9 +80,11 @@ func (c *ConnectorImpl) Validate(ctx context.Context) (annotations.Annotations, 
 
 	// Probe the REST surface only when it is configured (sync-only deployments skip it).
 	if c.client.RESTEnabled() {
-		if err := c.client.ValidateREST(ctx); err != nil {
-			return nil, fmt.Errorf("retool REST API validation failed: %w", err)
+		annos, err := c.client.ValidateREST(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("baton-retool: REST API validation failed: %w", err)
 		}
+		return annos, nil
 	}
 
 	return nil, nil

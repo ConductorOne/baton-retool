@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 
+	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/uhttp"
 )
 
@@ -70,10 +72,10 @@ func (e *RetoolErrorResponse) Message() string {
 }
 
 // doRequest is the single REST chokepoint: bearer auth, JSON in/out, and a typed error
-// body. It returns the HTTP status code so callers can branch on it (e.g. delete
-// idempotency) without leaking the *http.Response. Per repo convention it returns raw
-// errors — the connector layer wraps.
-func (r *restClient) doRequest(ctx context.Context, method, endpoint string, query url.Values, body, out interface{}) (int, error) {
+// body. It returns rate-limit annotations (so the SDK can back off) and the HTTP status
+// code so callers can branch on it (e.g. conflict/not-found) without leaking the
+// *http.Response. Per repo convention it returns raw errors — the connector layer wraps.
+func (r *restClient) doRequest(ctx context.Context, method, endpoint string, query url.Values, body, out interface{}) (annotations.Annotations, int, error) {
 	// JoinPath preserves any base-URL path prefix (e.g. a reverse proxy at /retool).
 	u := r.baseURL.JoinPath(endpoint)
 	u.RawQuery = query.Encode()
@@ -88,72 +90,82 @@ func (r *restClient) doRequest(ctx context.Context, method, endpoint string, que
 
 	req, err := r.httpClient.NewRequest(ctx, method, u, reqOpts...)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 
 	var errResp RetoolErrorResponse
-	doOpts := []uhttp.DoOption{uhttp.WithErrorResponse(&errResp)}
+	var ratelimitData v2.RateLimitDescription
+	doOpts := []uhttp.DoOption{
+		uhttp.WithErrorResponse(&errResp),
+		uhttp.WithRatelimitData(&ratelimitData),
+	}
 	if out != nil {
 		doOpts = append(doOpts, uhttp.WithJSONResponse(out))
 	}
 
 	resp, err := r.httpClient.Do(req, doOpts...)
+
+	// Surface rate-limit data on every path (including 429/errors) so the caller can
+	// merge it into the action/provisioning annotations and the SDK can back off.
+	var annos annotations.Annotations
+	annos.WithRateLimiting(&ratelimitData)
+
 	if resp != nil {
 		// uhttp already drained, closed, and replaced the body with a no-op closer;
 		// closing again is harmless and satisfies the bodyclose linter.
 		defer resp.Body.Close()
-		return resp.StatusCode, err
+		return annos, resp.StatusCode, err
 	}
-	return 0, err
+	return annos, 0, err
 }
 
 // ValidateREST cheaply confirms the REST token + base URL work (used by Validate()).
-func (c *Client) ValidateREST(ctx context.Context) error {
+func (c *Client) ValidateREST(ctx context.Context) (annotations.Annotations, error) {
 	if c.rest == nil {
-		return nil
+		return nil, nil
 	}
 	q := url.Values{}
 	q.Set("limit", "1")
-	_, err := c.rest.doRequest(ctx, http.MethodGet, usersEndpoint, q, nil, nil)
-	return err
+	annos, _, err := c.rest.doRequest(ctx, http.MethodGet, usersEndpoint, q, nil, nil)
+	return annos, err
 }
 
 // CreateUser provisions a new Retool user. Returns ErrUserAlreadyExists on a duplicate
 // email (HTTP 409) so the caller can resolve and return the existing account.
-func (c *Client) CreateUser(ctx context.Context, params CreateUserParams) (*RESTUser, error) {
+func (c *Client) CreateUser(ctx context.Context, params CreateUserParams) (*RESTUser, annotations.Annotations, error) {
 	var out userResponse
-	status, err := c.rest.doRequest(ctx, http.MethodPost, usersEndpoint, nil, createUserRequest(params), &out)
+	annos, status, err := c.rest.doRequest(ctx, http.MethodPost, usersEndpoint, nil, createUserRequest(params), &out)
 	if err != nil {
 		if status == http.StatusConflict {
-			return nil, ErrUserAlreadyExists
+			return nil, annos, ErrUserAlreadyExists
 		}
-		return nil, err
+		return nil, annos, err
 	}
 	if out.Data == nil {
-		return nil, fmt.Errorf("create user: empty response body")
+		return nil, annos, fmt.Errorf("create user: empty response body")
 	}
-	return out.Data, nil
+	return out.Data, annos, nil
 }
 
 // GetUserByEmail resolves a user by email via the server-side filter. Returns
 // ErrUserNotFound when no user matches and an error if the match is ambiguous.
-func (c *Client) GetUserByEmail(ctx context.Context, email string) (*RESTUser, error) {
+func (c *Client) GetUserByEmail(ctx context.Context, email string) (*RESTUser, annotations.Annotations, error) {
 	q := url.Values{}
 	q.Set("email", email)
 
 	var out userListResponse
-	_, err := c.rest.doRequest(ctx, http.MethodGet, usersEndpoint, q, nil, &out)
+	annos, _, err := c.rest.doRequest(ctx, http.MethodGet, usersEndpoint, q, nil, &out)
 	if err != nil {
-		return nil, err
+		return nil, annos, err
 	}
 
 	switch len(out.Data) {
 	case 0:
-		return nil, ErrUserNotFound
+		return nil, annos, ErrUserNotFound
 	case 1:
-		return out.Data[0], nil
+		return out.Data[0], annos, nil
 	default:
-		return nil, fmt.Errorf("ambiguous email lookup for %q: %d users matched", email, len(out.Data))
+		return nil, annos, fmt.Errorf("ambiguous email lookup for %q: %d users matched", email, len(out.Data))
 	}
 }
 
@@ -171,16 +183,16 @@ type patchUserRequest struct {
 // SetUserActive enables (active=true) or disables (active=false) a user by sid.
 // Idempotent: patching to the current state succeeds. Retool has no hard delete —
 // this deactivation/reactivation pair is the whole account lifecycle after create.
-func (c *Client) SetUserActive(ctx context.Context, sid string, active bool) error {
+func (c *Client) SetUserActive(ctx context.Context, sid string, active bool) (annotations.Annotations, error) {
 	body := patchUserRequest{
 		Operations: []patchOperation{{Op: "replace", Path: "/active", Value: active}},
 	}
-	status, err := c.rest.doRequest(ctx, http.MethodPatch, fmt.Sprintf(userByIDEndpoint, sid), nil, body, nil)
+	annos, status, err := c.rest.doRequest(ctx, http.MethodPatch, fmt.Sprintf(userByIDEndpoint, sid), nil, body, nil)
 	if err != nil {
 		if status == http.StatusNotFound {
-			return ErrUserNotFound
+			return annos, ErrUserNotFound
 		}
-		return err
+		return annos, err
 	}
-	return nil
+	return annos, nil
 }

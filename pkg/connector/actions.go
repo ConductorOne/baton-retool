@@ -35,10 +35,14 @@ var enableUserAction = v2.BatonActionSchema_builder{
 	Arguments: []*configv1.Field{
 		configv1.Field_builder{
 			Name:        "user_id",
-			DisplayName: "User ID",
-			Description: "The Baton resource ID of the Retool user to enable (e.g. u42).",
+			DisplayName: "User",
+			Description: "The Retool user to enable (reactivate).",
 			IsRequired:  true,
-			StringField: &configv1.StringField{},
+			ResourceIdField: configv1.ResourceIdField_builder{
+				Rules: configv1.ResourceIDRules_builder{
+					AllowedResourceTypeIds: []string{resourceTypeUser.Id},
+				}.Build(),
+			}.Build(),
 		}.Build(),
 	},
 	ReturnTypes: []*configv1.Field{
@@ -58,10 +62,14 @@ var disableUserAction = v2.BatonActionSchema_builder{
 	Arguments: []*configv1.Field{
 		configv1.Field_builder{
 			Name:        "user_id",
-			DisplayName: "User ID",
-			Description: "The Baton resource ID of the Retool user to disable (e.g. u42).",
+			DisplayName: "User",
+			Description: "The Retool user to disable (deactivate).",
 			IsRequired:  true,
-			StringField: &configv1.StringField{},
+			ResourceIdField: configv1.ResourceIdField_builder{
+				Rules: configv1.ResourceIDRules_builder{
+					AllowedResourceTypeIds: []string{resourceTypeUser.Id},
+				}.Build(),
+			}.Build(),
 		}.Build(),
 	},
 	ReturnTypes: []*configv1.Field{
@@ -96,56 +104,47 @@ func (c *ConnectorImpl) setUserActive(ctx context.Context, args *structpb.Struct
 	l := ctxzap.Extract(ctx)
 
 	if !c.client.RESTEnabled() {
-		return nil, nil, status.Error(codes.Unavailable, "retool REST API is not configured; set retool-api-base-url and retool-api-token to manage accounts")
+		return nil, nil, status.Error(codes.Unavailable, "baton-retool: REST API is not configured; set retool-api-base-url and retool-api-token to manage accounts")
 	}
 
-	rawID, err := getUserIDFromArgs(args)
+	// user_id is a ResourceIdField, so the value arrives as a {resource_type_id, resource_id}
+	// struct (the C1 resource picker), not a bare string.
+	userResID, err := actions.RequireResourceIDArg(args, "user_id")
 	if err != nil {
-		return nil, nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "baton-retool: %v", err)
 	}
+	if userResID.GetResourceType() != resourceTypeUser.Id {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "baton-retool: user_id must reference a %q resource, got %q", resourceTypeUser.Id, userResID.GetResourceType())
+	}
+	rawID := userResID.GetResource()
 
 	legacyID, err := parseObjectID(rawID)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.InvalidArgument, "invalid user_id %q: %v", rawID, err)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "baton-retool: invalid user_id %q: %v", rawID, err)
 	}
 
 	// Resolve the stable REST sid from the Postgres pool the connector already holds.
 	sid, err := c.client.GetUserSID(ctx, legacyID)
 	if err != nil {
 		if errors.Is(err, client.ErrUserNotFound) {
-			return nil, nil, status.Errorf(codes.NotFound, "user %q not found", rawID)
+			return nil, nil, status.Errorf(codes.NotFound, "baton-retool: user %q not found", rawID)
 		}
-		return nil, nil, status.Errorf(codes.Internal, "failed to resolve user %q: %v", rawID, err)
+		return nil, nil, status.Errorf(codes.Internal, "baton-retool: failed to resolve user %q: %v", rawID, err)
 	}
 
 	l.Debug("setting retool user state", zap.String("sid", sid), zap.Bool("active", active))
 
-	if err := c.client.SetUserActive(ctx, sid, active); err != nil {
+	annos, err := c.client.SetUserActive(ctx, sid, active)
+	if err != nil {
 		if errors.Is(err, client.ErrUserNotFound) {
-			return nil, nil, status.Errorf(codes.NotFound, "user %q not found", rawID)
+			return nil, annos, status.Errorf(codes.NotFound, "baton-retool: user %q not found", rawID)
 		}
-		return nil, nil, status.Errorf(codes.Internal, "failed to set user %q active=%t: %v", rawID, active, err)
+		return nil, annos, status.Errorf(codes.Internal, "baton-retool: failed to set user %q active=%t: %v", rawID, active, err)
 	}
 
 	return &structpb.Struct{
 		Fields: map[string]*structpb.Value{
 			"success": structpb.NewBoolValue(true),
 		},
-	}, nil, nil
-}
-
-// getUserIDFromArgs extracts the user_id string from action args.
-func getUserIDFromArgs(args *structpb.Struct) (string, error) {
-	if args == nil || args.Fields == nil {
-		return "", fmt.Errorf("args cannot be nil")
-	}
-	v, ok := args.Fields["user_id"]
-	if !ok {
-		return "", fmt.Errorf("missing required argument: user_id")
-	}
-	id := v.GetStringValue()
-	if id == "" {
-		return "", fmt.Errorf("user_id cannot be empty")
-	}
-	return id, nil
+	}, annos, nil
 }
