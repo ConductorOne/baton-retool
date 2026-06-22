@@ -65,6 +65,19 @@ func (u *UserModel) GetLastLoggedIn() time.Time {
 	return time.Time{}
 }
 
+func (c *Client) GetUser(ctx context.Context, userID int64) (*UserModel, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("getting user", zap.Int64("user_id", userID))
+
+	var ret UserModel
+	err := pgxscan.Get(ctx, c.db, &ret, `SELECT "id", "email", "firstName", "lastName", "profilePhotoUrl", "enabled", "userName", "organizationId", "lastLoggedIn" FROM users WHERE "id"=$1`, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ret, nil
+}
+
 func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager, skipDisabledUsers bool) ([]*UserModel, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing users for org", zap.Int64("org_id", orgID))

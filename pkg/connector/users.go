@@ -43,6 +43,11 @@ func (s *userSyncer) List(
 		return nil, "", nil, err
 	}
 
+	org, err := s.client.GetOrganization(ctx, orgID)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("baton-retool: failed to get organization %d: %w", orgID, err)
+	}
+
 	users, nextPageToken, err := s.client.ListUsersForOrg(ctx, orgID, &client.Pager{Token: pToken.Token, Size: pToken.Size}, s.skipDisabledUsers)
 	if err != nil {
 		return nil, "", nil, err
@@ -61,13 +66,14 @@ func (s *userSyncer) List(
 
 		resourceID := formatObjectID(resourceTypeUser.Id, o.ID)
 		ut, err := resources.NewUserTrait(resources.WithEmail(o.Email, true), resources.WithStatus(utStatus), resources.WithUserProfile(map[string]interface{}{
-			"email":           o.Email,
-			"first_name":      o.GetFirstName(),
-			"last_name":       o.GetLastName(),
-			"user_id":         fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
-			"last_logged_in":  o.GetLastLoggedIn().Format("2006-01-02 15:04:05.999999999 -0700 MST"),
-			"organization_id": o.OrganizationID,
-			"user_name":       o.GetUserName(),
+			"email":             o.Email,
+			"first_name":        o.GetFirstName(),
+			"last_name":         o.GetLastName(),
+			"user_id":           fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
+			"last_logged_in":    o.GetLastLoggedIn().Format("2006-01-02 15:04:05.999999999 -0700 MST"),
+			"organization_id":   o.OrganizationID,
+			"organization_name": org.Name,
+			"user_name":         o.GetUserName(),
 		}))
 		if err != nil {
 			return nil, "", nil, err
@@ -75,8 +81,10 @@ func (s *userSyncer) List(
 
 		annos.Append(ut)
 
+		displayName := fmt.Sprintf("%s %s (%s)", o.GetFirstName(), o.GetLastName(), org.Name)
+
 		ret = append(ret, &v2.Resource{
-			DisplayName: fmt.Sprintf("%s %s", o.GetFirstName(), o.GetLastName()),
+			DisplayName: displayName,
 			Id: &v2.ResourceId{
 				ResourceType: s.resourceType.Id,
 				Resource:     resourceID,

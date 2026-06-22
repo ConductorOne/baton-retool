@@ -158,6 +158,10 @@ func (o *groupSyncer) Grant(ctx context.Context, principial *v2.Resource, entitl
 		return nil, err
 	}
 
+	if err := o.validateOrgMatch(ctx, userID, groupID); err != nil {
+		return nil, err
+	}
+
 	member, err := o.client.GetGroupMember(ctx, groupID, userID)
 	if err != nil {
 		return nil, err
@@ -207,6 +211,10 @@ func (o *groupSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.
 		return nil, err
 	}
 
+	if err := o.validateOrgMatch(ctx, userID, groupID); err != nil {
+		return nil, err
+	}
+
 	err = o.client.RemoveGroupMember(ctx, groupID, userID)
 	if err != nil {
 		l.Error(
@@ -219,6 +227,31 @@ func (o *groupSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.
 	}
 
 	return nil, nil
+}
+
+// validateOrgMatch checks that the user belongs to the same organization as the group.
+// This prevents silent failures where a grant/revoke succeeds at the DB level but
+// doesn't actually take effect in Retool because the user is in a different org.
+func (o *groupSyncer) validateOrgMatch(ctx context.Context, userID, groupID int64) error {
+	user, err := o.client.GetUser(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("baton-retool: failed to get user %d for org validation: %w", userID, err)
+	}
+
+	group, err := o.client.GetGroup(ctx, groupID)
+	if err != nil {
+		return fmt.Errorf("baton-retool: failed to get group %d for org validation: %w", groupID, err)
+	}
+
+	groupOrgID := group.GetOrgID()
+	if groupOrgID != 0 && user.OrganizationID != groupOrgID {
+		return fmt.Errorf(
+			"baton-retool: organization mismatch - user %d belongs to org %d but group %d belongs to org %d",
+			userID, user.OrganizationID, groupID, groupOrgID,
+		)
+	}
+
+	return nil
 }
 
 func newGroupSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *groupSyncer {

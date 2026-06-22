@@ -42,8 +42,9 @@ func getConnector(ctx context.Context, v *viper.Viper) (types.ConnectorServer, e
 	skipPages := v.GetBool(SkipPages.FieldName)
 	skipResources := v.GetBool(SkipResources.FieldName)
 	skipDisabledUsers := v.GetBool(SkipDisabledUsers.FieldName)
+	organizationID := v.GetString(OrganizationID.FieldName)
 
-	cb, err := connector.New(ctx, connString, skipPages, skipResources, skipDisabledUsers)
+	cb, err := connector.New(ctx, connString, skipPages, skipResources, skipDisabledUsers, organizationID)
 	if err != nil {
 		l.Error("error creating connector builder", zap.Error(err))
 		return nil, err

@@ -2,11 +2,13 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/georgysavva/scany/pgxscan"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"go.uber.org/zap"
 )
 
 type OrgModel struct {
@@ -14,8 +16,21 @@ type OrgModel struct {
 	Name string `db:"name"`
 }
 
+func (c *Client) GetOrganization(ctx context.Context, orgID int64) (*OrgModel, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("getting organization", zap.Int64("org_id", orgID))
+
+	var ret OrgModel
+	err := pgxscan.Get(ctx, c.db, &ret, `SELECT "id", "name" FROM organizations WHERE "id"=$1`, orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ret, nil
+}
+
 // select id, domain, name, hostname, subdomain from organizations;.
-func (c *Client) ListOrganizations(ctx context.Context, pager *Pager) ([]*OrgModel, string, error) {
+func (c *Client) ListOrganizations(ctx context.Context, pager *Pager, organizationID *int64) ([]*OrgModel, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing organizations")
 
@@ -27,13 +42,20 @@ func (c *Client) ListOrganizations(ctx context.Context, pager *Pager) ([]*OrgMod
 
 	sb := &strings.Builder{}
 
-	_, _ = sb.WriteString(`SELECT "id", "name" FROM organizations ORDER BY "id"`)
+	_, _ = sb.WriteString(`SELECT "id", "name" FROM organizations `)
 
-	_, _ = sb.WriteString("LIMIT $1 ")
+	if organizationID != nil {
+		args = append(args, *organizationID)
+		_, _ = sb.WriteString(fmt.Sprintf(`WHERE "id"=$%d `, len(args)))
+	}
+
+	_, _ = sb.WriteString(`ORDER BY "id" `)
+
 	args = append(args, limit+1)
+	_, _ = sb.WriteString(fmt.Sprintf("LIMIT $%d ", len(args)))
 	if offset > 0 {
-		_, _ = sb.WriteString("OFFSET $2")
 		args = append(args, offset)
+		_, _ = sb.WriteString(fmt.Sprintf("OFFSET $%d", len(args)))
 	}
 
 	var ret []*OrgModel
