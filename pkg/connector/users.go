@@ -8,7 +8,6 @@ import (
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
-	_ "github.com/georgysavva/scany/pgxscan"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 )
@@ -38,12 +37,7 @@ func (s *userSyncer) List(
 		return nil, "", nil, nil
 	}
 
-	orgID, err := parseObjectID(parentResourceID.Resource)
-	if err != nil {
-		return nil, "", nil, err
-	}
-
-	users, nextPageToken, err := s.client.ListUsersForOrg(ctx, orgID, &client.Pager{Token: pToken.Token, Size: pToken.Size}, s.skipDisabledUsers)
+	users, nextPageToken, err := s.client.ListUsers(ctx, &client.Pager{Token: pToken.Token, Size: pToken.Size}, s.skipDisabledUsers)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -53,33 +47,42 @@ func (s *userSyncer) List(
 		var annos annotations.Annotations
 
 		var utStatus v2.UserTrait_Status_Status
-		if o.Enabled {
+		if o.Active {
 			utStatus = v2.UserTrait_Status_STATUS_ENABLED
 		} else {
 			utStatus = v2.UserTrait_Status_STATUS_DISABLED
 		}
 
-		resourceID := formatObjectID(resourceTypeUser.Id, o.ID)
-		ut, err := resources.NewUserTrait(resources.WithEmail(o.Email, true), resources.WithStatus(utStatus), resources.WithUserProfile(map[string]interface{}{
-			"email":           o.Email,
-			"first_name":      o.GetFirstName(),
-			"last_name":       o.GetLastName(),
-			"user_id":         fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
-			"last_logged_in":  o.GetLastLoggedIn().Format("2006-01-02 15:04:05.999999999 -0700 MST"),
-			"organization_id": o.OrganizationID,
-			"user_name":       o.GetUserName(),
-		}))
+		resourceID := formatObjectID(resourceTypeUser.Id, o.GetID())
+		ut, err := resources.NewUserTrait(
+			resources.WithEmail(o.Email, true),
+			resources.WithStatus(utStatus),
+			resources.WithUserProfile(map[string]interface{}{
+				"email":      o.Email,
+				"first_name": o.GetFirstName(),
+				"last_name":  o.GetLastName(),
+				"user_id":    fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
+			}),
+		)
 		if err != nil {
 			return nil, "", nil, err
 		}
 
 		annos.Append(ut)
 
+		displayName := fmt.Sprintf("%s %s", o.GetFirstName(), o.GetLastName())
+		if displayName == " " {
+			displayName = o.Email
+		}
+
 		ret = append(ret, &v2.Resource{
-			DisplayName: fmt.Sprintf("%s %s", o.GetFirstName(), o.GetLastName()),
+			DisplayName: displayName,
 			Id: &v2.ResourceId{
 				ResourceType: s.resourceType.Id,
 				Resource:     resourceID,
+			},
+			ExternalId: &v2.ExternalId{
+				Id: o.ID.String(),
 			},
 			ParentResourceId: parentResourceID,
 			Annotations:      annos,

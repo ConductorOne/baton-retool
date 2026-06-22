@@ -6,7 +6,6 @@ import (
 
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	_ "github.com/georgysavva/scany/pgxscan"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 
 	"github.com/conductorone/baton-retool/pkg/client"
@@ -38,7 +37,13 @@ func (s *orgSyncer) List(
 ) ([]*v2.Resource, string, annotations.Annotations, error) {
 	var annos annotations.Annotations
 
-	orgs, nextPageToken, err := s.client.ListOrganizations(ctx, &client.Pager{Token: pToken.Token, Size: pToken.Size})
+	// The API token is scoped to a single organization, so we fetch it directly.
+	if pToken.Token != "" {
+		// Already returned the single org in a previous call.
+		return nil, "", nil, nil
+	}
+
+	org, err := s.client.GetOrganization(ctx)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -52,19 +57,18 @@ func (s *orgSyncer) List(
 		annos.Append(&v2.ChildResourceType{ResourceTypeId: resourceTypeResource.Id})
 	}
 
-	var ret []*v2.Resource
-	for _, o := range orgs {
-		ret = append(ret, &v2.Resource{
-			DisplayName: o.Name,
+	ret := []*v2.Resource{
+		{
+			DisplayName: org.Name,
 			Id: &v2.ResourceId{
 				ResourceType: s.resourceType.Id,
-				Resource:     formatObjectID(s.resourceType.Id, o.ID),
+				Resource:     formatObjectID(s.resourceType.Id, org.GetID()),
 			},
 			Annotations: annos,
-		})
+		},
 	}
 
-	return ret, nextPageToken, nil, nil
+	return ret, "", nil, nil
 }
 
 func (s *orgSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pToken *pagination.Token) ([]*v2.Entitlement, string, annotations.Annotations, error) {
@@ -172,8 +176,8 @@ func (s *orgSyncer) memberGrant(ctx context.Context, resource *v2.Resource, uID 
 func (s *orgSyncer) grantsForMember(ctx context.Context, resource *v2.Resource, group *client.GroupModel, userID int64) ([]*v2.Grant, error) {
 	var ret []*v2.Grant
 
-	if group.UniversalAccess != noneLevel {
-		ret = append(ret, s.memberGrant(ctx, resource, userID, fmt.Sprintf("universal:%s", group.UniversalAccess)))
+	if group.UniversalAppAccess != noneLevel {
+		ret = append(ret, s.memberGrant(ctx, resource, userID, fmt.Sprintf("universal:%s", group.UniversalAppAccess)))
 	}
 
 	if group.UniversalResourceAccess != noneLevel {
@@ -205,11 +209,6 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 	l := ctxzap.Extract(ctx)
 	var ret []*v2.Grant
 
-	orgID, err := parseObjectID(resource.Id.Resource)
-	if err != nil {
-		return nil, "", nil, err
-	}
-
 	bag, err := parsePageToken(pToken.Token, resource.Id)
 	if err != nil {
 		return nil, "", nil, err
@@ -217,7 +216,7 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 
 	switch bag.ResourceTypeID() {
 	case resourceTypeOrg.Id:
-		groups, nextPageToken, err := s.client.ListGroupsForOrg(ctx, orgID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size})
+		groups, nextPageToken, err := s.client.ListGroups(ctx, &client.Pager{Token: bag.PageToken(), Size: pToken.Size})
 		if err != nil {
 			return nil, "", nil, err
 		}
@@ -227,11 +226,10 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 			return nil, "", nil, err
 		}
 
-		// push pagination state for each group
 		for _, g := range groups {
 			bag.Push(pagination.PageState{
 				ResourceTypeID: resourceTypeGroup.Id,
-				ResourceID:     formatGroupObjectID(g.ID),
+				ResourceID:     formatGroupObjectID(g.GetID()),
 			})
 		}
 
@@ -241,34 +239,26 @@ func (s *orgSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *p
 			return nil, "", nil, err
 		}
 
-		g, err := s.client.GetGroup(ctx, gID)
+		g, err := s.client.GetGroup(ctx, fmt.Sprintf("%d", gID))
 		if err != nil {
 			return nil, "", nil, err
 		}
 
-		members, nextPageToken, err := s.client.ListGroupMembers(ctx, g.ID, &client.Pager{Token: bag.PageToken(), Size: pToken.Size}, s.skipDisabledUsers)
-		if err != nil {
-			return nil, "", nil, err
-		}
-
-		err = bag.Next(nextPageToken)
-		if err != nil {
-			return nil, "", nil, err
-		}
-
-		for _, m := range members {
-			if m.GetUserID() == 0 {
+		for _, m := range g.Members {
+			if m.GetID() == 0 {
 				l.Debug("member did not have user ID defined -- skipping")
 				continue
 			}
 
-			memberGrants, err := s.grantsForMember(ctx, resource, g, m.GetUserID())
+			memberGrants, err := s.grantsForMember(ctx, resource, g, m.GetID())
 			if err != nil {
 				return nil, "", nil, err
 			}
 
 			ret = append(ret, memberGrants...)
 		}
+
+		bag.Pop()
 
 	default:
 		return nil, "", nil, fmt.Errorf("unexpected resource type while processing org grants: %s", bag.ResourceTypeID())

@@ -16,6 +16,10 @@ func parseObjectID(id string) (int64, error) {
 	return strconv.ParseInt(id[1:], 10, 64)
 }
 
+func parseObjectIDString(id string) string {
+	return id[1:]
+}
+
 func formatGroupObjectID(id int64) string {
 	return fmt.Sprintf("%d", id)
 }
