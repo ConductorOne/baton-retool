@@ -6,7 +6,7 @@ import (
 
 	"fmt"
 
-	jose "github.com/go-jose/go-jose/v3"
+	jose "github.com/go-jose/go-jose/v4"
 )
 
 // VerifyReasons expresses why a JWT was not valid.
@@ -79,11 +79,20 @@ type VerifyConfig struct {
 	MaxExpirationFromNow time.Duration
 	// KeySet is a set of JWKs that are trusted by the verifier, and used to validate the JWT.
 	KeySet *jose.JSONWebKeySet
-	// ExpectSymmetrical validates asymmetrical keys are used, if true symmetrical keys are expected.
+
+	// ExpectSymmetrical validates asymmetrical keys are used, if true symmetrical keys are expected. Unused if ExpectSSignatureAlgorithms is set.
 	ExpectSymmetrical bool
+
+	// ExpectSSignatureAlgorithms is a list of allowed signature algorithms for the JWT.  If unset, DefaultSignatureAlgorithms is used.  If ExpectSymmetrical is true, DefaultSymmetricalSignatureAlgorithm is used.
+	ExpectSSignatureAlgorithms []jose.SignatureAlgorithm
+
+	// ClockTolerance allows for clock skew between systems. This duration is added
+	// to expiry (exp) checks and subtracted from not-before (nbf) checks.
+	// Defaults to 0 (no tolerance). Must not be negative.
+	ClockTolerance time.Duration
 }
 
-var validSignatureAlgorithm = []jose.SignatureAlgorithm{
+var DefaultSignatureAlgorithms = []jose.SignatureAlgorithm{
 	jose.RS256, // RSASSA-PKCS-v1.5 using SHA-256
 	jose.RS384, // RSASSA-PKCS-v1.5 using SHA-384
 	jose.RS512, // RSASSA-PKCS-v1.5 using SHA-512
@@ -96,23 +105,10 @@ var validSignatureAlgorithm = []jose.SignatureAlgorithm{
 	jose.EdDSA, // EdDSA using Ed25519
 }
 
-var validSymmetricalSignatureAlgorithm = []jose.SignatureAlgorithm{
+var DefaultSymmetricalSignatureAlgorithm = []jose.SignatureAlgorithm{
 	jose.HS256, // HMAC using SHA-256
 	jose.HS384, // HMAC using SHA-384
 	jose.HS512, // HMAC using SHA-512
-}
-
-func isAllowedAlgo(in jose.SignatureAlgorithm, vc VerifyConfig) bool {
-	validSigAlgo := validSignatureAlgorithm
-	if vc.ExpectSymmetrical {
-		validSigAlgo = validSymmetricalSignatureAlgorithm
-	}
-	for _, validAlgo := range validSigAlgo {
-		if in == validAlgo {
-			return true
-		}
-	}
-	return false
 }
 
 // Verify verifies a JWT, and returns a map containing the payload claims
@@ -144,6 +140,13 @@ func Verify(input []byte, vc VerifyConfig) (map[string]interface{}, error) {
 // VerifyRaw verifies a JWT with the same constaints as xjwt.Verify,
 // but returns the payload as a byte slice
 func VerifyRaw(input []byte, vc VerifyConfig) ([]byte, error) {
+	if vc.ClockTolerance < 0 {
+		return nil, &VerifyErr{
+			msg:    "xjwt: ClockTolerance must not be negative",
+			reason: JWT_UNKNOWN,
+		}
+	}
+
 	var now time.Time
 	if vc.Now == nil {
 		now = time.Now()
@@ -151,7 +154,19 @@ func VerifyRaw(input []byte, vc VerifyConfig) ([]byte, error) {
 		now = vc.Now()
 	}
 
-	object, err := jose.ParseSigned(string(input))
+	expectedSigAlgos := vc.ExpectSSignatureAlgorithms
+	if len(expectedSigAlgos) == 0 {
+		if vc.ExpectSymmetrical {
+			expectedSigAlgos = DefaultSymmetricalSignatureAlgorithm
+		} else {
+			expectedSigAlgos = DefaultSignatureAlgorithms
+		}
+	}
+
+	object, err := jose.ParseSignedCompact(
+		string(input),
+		expectedSigAlgos,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -171,15 +186,6 @@ func VerifyRaw(input []byte, vc VerifyConfig) ([]byte, error) {
 	}
 
 	signature := object.Signatures[0]
-
-	algo := jose.SignatureAlgorithm(signature.Header.Algorithm)
-
-	if !isAllowedAlgo(algo, vc) {
-		return nil, &VerifyErr{
-			msg:    "xjwt: signature uses unsupported algorithm",
-			reason: JWT_INVALID_SIGNATURE,
-		}
-	}
 
 	var keys []jose.JSONWebKey
 	if signature.Header.KeyID == "" {
@@ -277,9 +283,13 @@ func VerifyRaw(input []byte, vc VerifyConfig) ([]byte, error) {
 	}
 
 	expires := time.Time(idt.Expiry)
-	if now.After(expires) {
+	if now.After(expires.Add(vc.ClockTolerance)) {
+		toleranceMsg := ""
+		if vc.ClockTolerance > 0 {
+			toleranceMsg = fmt.Sprintf(" (with %s tolerance)", vc.ClockTolerance)
+		}
 		return nil, &VerifyErr{
-			msg:    fmt.Sprintf("xjwt: JWT expired: now:'%s' is after jwt:'%s'", now.String(), expires.String()),
+			msg:    fmt.Sprintf("xjwt: JWT expired%s: now:'%s' is after jwt:'%s'", toleranceMsg, now.String(), expires.String()),
 			reason: JWT_EXPIRED,
 		}
 	}
@@ -297,9 +307,13 @@ func VerifyRaw(input []byte, vc VerifyConfig) ([]byte, error) {
 	}
 
 	nbf := time.Time(idt.NotBefore)
-	if now.Before(nbf) {
+	if now.Before(nbf.Add(-vc.ClockTolerance)) {
+		toleranceMsg := ""
+		if vc.ClockTolerance > 0 {
+			toleranceMsg = fmt.Sprintf(" (with %s tolerance)", vc.ClockTolerance)
+		}
 		return nil, &VerifyErr{
-			msg:    fmt.Sprintf("xjwt: JWT nbf is before now: jwt:'%s' now:'%s'", nbf.String(), now.String()),
+			msg:    fmt.Sprintf("xjwt: JWT not yet valid%s: nbf:'%s' now:'%s'", toleranceMsg, nbf.String(), now.String()),
 			reason: JWT_EXPIRED,
 		}
 	}

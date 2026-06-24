@@ -2,13 +2,17 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/conductorone/baton-retool/pkg/client"
 	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
 	_ "github.com/georgysavva/scany/pgxscan"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 )
@@ -95,6 +99,102 @@ func (s *userSyncer) Entitlements(ctx context.Context, resource *v2.Resource, pT
 
 func (s *userSyncer) Grants(ctx context.Context, resource *v2.Resource, pToken *pagination.Token) ([]*v2.Grant, string, annotations.Annotations, error) {
 	return nil, "", nil, nil
+}
+
+// CreateAccountCapabilityDetails advertises how accounts are provisioned. Retool sends an
+// invitation on create (no connector-supplied password), so no credential is required.
+func (s *userSyncer) CreateAccountCapabilityDetails(ctx context.Context) (*v2.CredentialDetailsAccountProvisioning, annotations.Annotations, error) {
+	return &v2.CredentialDetailsAccountProvisioning{
+		SupportedCredentialOptions: []v2.CapabilityDetailCredentialOption{
+			v2.CapabilityDetailCredentialOption_CAPABILITY_DETAIL_CREDENTIAL_OPTION_NO_PASSWORD,
+		},
+		PreferredCredentialOption: v2.CapabilityDetailCredentialOption_CAPABILITY_DETAIL_CREDENTIAL_OPTION_NO_PASSWORD,
+	}, nil, nil
+}
+
+// CreateAccount provisions a Retool user via the REST API. The created account is keyed by
+// its Postgres legacy_id (returned in the create response), which is exactly the id the
+// next full sync produces (user:<int64>) — no phantom-user reconcile needed.
+func (s *userSyncer) CreateAccount(
+	ctx context.Context,
+	accountInfo *v2.AccountInfo,
+	credentialOptions *v2.LocalCredentialOptions,
+) (connectorbuilder.CreateAccountResponse, []*v2.PlaintextData, annotations.Annotations, error) {
+	if !s.client.RESTEnabled() {
+		return nil, nil, nil, status.Error(codes.Unavailable, "baton-retool: REST API is not configured; set retool-api-base-url and retool-api-token to provision accounts")
+	}
+
+	profile := accountInfo.GetProfile().AsMap()
+	email := stringFromProfile(profile, "email")
+	if email == "" {
+		return nil, nil, nil, status.Error(codes.InvalidArgument, "baton-retool: email is required to create an account")
+	}
+	firstName := stringFromProfile(profile, "first_name")
+	lastName := stringFromProfile(profile, "last_name")
+	if firstName == "" || lastName == "" {
+		return nil, nil, nil, status.Error(codes.InvalidArgument, "baton-retool: first_name and last_name are required to create an account")
+	}
+
+	user, annos, err := s.client.CreateUser(ctx, client.CreateUserParams{
+		Email:     email,
+		FirstName: firstName,
+		LastName:  lastName,
+		UserType:  stringFromProfile(profile, "user_type"),
+	})
+	if err != nil {
+		// Idempotent: a user with this email already exists -> return it as success.
+		// Keep the most recent call's rate-limit annotations.
+		if errors.Is(err, client.ErrUserAlreadyExists) {
+			user, annos, err = s.client.GetUserByEmail(ctx, email)
+		}
+		if err != nil {
+			return nil, nil, annos, status.Errorf(codes.Internal, "baton-retool: failed to create account for %q: %v", email, err)
+		}
+	}
+
+	resource, err := s.restUserResource(user)
+	if err != nil {
+		return nil, nil, annos, err
+	}
+
+	return &v2.CreateAccountResponse_SuccessResult{
+		Resource: resource,
+	}, nil, annos, nil
+}
+
+// restUserResource builds a user resource from a REST user, keyed by its Postgres
+// legacy_id so it matches what a full sync produces (user:<int64>).
+func (s *userSyncer) restUserResource(u *client.RESTUser) (*v2.Resource, error) {
+	utStatus := v2.UserTrait_Status_STATUS_ENABLED
+	if !u.Active {
+		utStatus = v2.UserTrait_Status_STATUS_DISABLED
+	}
+
+	ut, err := resources.NewUserTrait(
+		resources.WithEmail(u.Email, true),
+		resources.WithStatus(utStatus),
+		resources.WithUserProfile(map[string]interface{}{
+			"email":      u.Email,
+			"first_name": u.FirstName,
+			"last_name":  u.LastName,
+			"user_type":  u.UserType,
+		}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var annos annotations.Annotations
+	annos.Append(ut)
+
+	return &v2.Resource{
+		DisplayName: fmt.Sprintf("%s %s", u.FirstName, u.LastName),
+		Id: &v2.ResourceId{
+			ResourceType: resourceTypeUser.Id,
+			Resource:     formatObjectID(resourceTypeUser.Id, u.LegacyID),
+		},
+		Annotations: annos,
+	}, nil
 }
 
 func newUserSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *userSyncer {

@@ -5,10 +5,14 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	v1 "github.com/conductorone/baton-sdk/pb/c1/connectorapi/baton/v1"
 	"github.com/conductorone/baton-sdk/pkg/provisioner"
 	"github.com/conductorone/baton-sdk/pkg/tasks"
 	"github.com/conductorone/baton-sdk/pkg/types"
+	"github.com/conductorone/baton-sdk/pkg/uotel"
+	"github.com/conductorone/baton-sdk/pkg/uotel/uotelzap"
 )
 
 type localCredentialRotator struct {
@@ -30,17 +34,22 @@ func (m *localCredentialRotator) ShouldDebug() bool {
 func (m *localCredentialRotator) Next(ctx context.Context) (*v1.Task, time.Duration, error) {
 	var task *v1.Task
 	m.o.Do(func() {
-		task = &v1.Task{
-			TaskType: &v1.Task_RotateCredentials{},
-		}
+		task = v1.Task_builder{
+			RotateCredentials: &v1.Task_RotateCredentialsTask{},
+		}.Build()
 	})
 	return task, 0, nil
 }
 
 func (m *localCredentialRotator) Process(ctx context.Context, task *v1.Task, cc types.ConnectorClient) error {
+	ctx, span := tracer.Start(ctx, "localCredentialRotator.Process", trace.WithNewRoot())
+	ctx = uotelzap.WithSpanLogFields(ctx)
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
 	accountManager := provisioner.NewCredentialRotator(cc, m.dbPath, m.resourceId, m.resourceType)
 
-	err := accountManager.Run(ctx)
+	err = accountManager.Run(ctx)
 	if err != nil {
 		return err
 	}

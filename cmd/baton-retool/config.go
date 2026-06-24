@@ -22,6 +22,20 @@ var (
 		"skip-disabled-users",
 		field.WithDescription("Skip syncing disabled users"),
 	)
+	// REST surface for account provisioning/deprovisioning (CXH-1585). Optional:
+	// sync-only deployments keep working without these; the lifecycle handlers fail
+	// fast with a clear error when they are absent.
+	RetoolAPIBaseURL = field.StringField(
+		"retool-api-base-url",
+		field.WithDisplayName("Retool API Base URL"),
+		field.WithDescription("Base URL of the Retool REST API, e.g. https://<org>.retool.com. Required only for account provisioning/deprovisioning."),
+	)
+	RetoolAPIToken = field.StringField(
+		"retool-api-token",
+		field.WithDisplayName("Retool API Token"),
+		field.WithDescription("Retool API token with users:read + users:write. Required only for account provisioning/deprovisioning."),
+		field.WithIsSecret(true),
+	)
 )
 
 var configurationFields = []field.SchemaField{
@@ -29,8 +43,19 @@ var configurationFields = []field.SchemaField{
 	SkipPages,
 	SkipResources,
 	SkipDisabledUsers,
+	RetoolAPIBaseURL,
+	RetoolAPIToken,
 }
 
-var configRelations = []field.SchemaFieldRelationship{}
+// retool-api-base-url and retool-api-token are both-or-neither.
+var configRelations = []field.SchemaFieldRelationship{
+	field.FieldsRequiredTogether(RetoolAPIBaseURL, RetoolAPIToken),
+}
 
-var configuration = field.NewConfiguration(configurationFields, configRelations...)
+var configuration = field.NewConfiguration(
+	configurationFields,
+	field.WithConstraints(configRelations...),
+	field.WithConnectorDisplayName("Retool"),
+	field.WithIconUrl("/static/app-icons/retool.svg"),
+	field.WithHelpUrl("/docs/baton/retool"),
+)

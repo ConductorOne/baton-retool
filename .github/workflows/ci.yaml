@@ -1,34 +1,38 @@
 name: ci
 on: pull_request
+
+# A new push to the PR supersedes any in-flight run (the integration job is heavy).
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   go-lint:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Install Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.24.x
-      - name: Checkout code
-        uses: actions/checkout@v4
+          go-version-file: go.mod
       - name: Run linters
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          skip-cache: true
+          # Pinned so lint findings don't drift with new golangci-lint releases.
+          # Bump deliberately, fixing any new findings in the same PR.
+          version: v2.11.1
           args: --timeout=3m
   go-test:
-    strategy:
-      matrix:
-        go-version: [1.24.x]
-        platform: [ubuntu-latest]
-    runs-on: ${{ matrix.platform }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Install Go
-        if: success()
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ matrix.go-version }}
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: go tests
         run: go test -v -covermode=count -json ./... > test.json
       - name: annotate go tests
@@ -36,3 +40,89 @@ jobs:
         uses: guyarb/golang-test-annotations@v0.5.1
         with:
           test-results: test.json
+  # baton-retool can't be exercised with a simple mock: sync + group/page provisioning
+  # need Retool's internal Postgres, and account provisioning needs the Retool REST API.
+  # This job stands up a throwaway self-hosted Retool (postgres + jobs-runner + api) via
+  # Docker, seeds an admin/org, mints a REST token, then runs sync + grant/revoke +
+  # account provisioning against it. No repo secrets are required — every credential is
+  # generated per run and torn down with the stack.
+  integration-test:
+    runs-on: ubuntu-latest
+    env:
+      RETOOL_VERSION: 3.334.17-stable
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: BatonCITest123!
+      BATON_LOG_LEVEL: info
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build baton-retool
+        run: go build -o baton-retool ./cmd/baton-retool
+
+      - name: Generate Retool env (throwaway secrets for the ephemeral DB)
+        working-directory: test/integration
+        run: |
+          cat > docker.env <<EOF
+          DEPLOYMENT_TEMPLATE_TYPE=docker-compose
+          POSTGRES_HOST=postgres
+          POSTGRES_DB=hammerhead_production
+          POSTGRES_PORT=5432
+          POSTGRES_USER=retool_internal_user
+          POSTGRES_PASSWORD=$(openssl rand -hex 24)
+          JWT_SECRET=$(openssl rand -hex 64)
+          ENCRYPTION_KEY=$(openssl rand -hex 24)
+          LICENSE_KEY=EXPIRED-LICENSE-KEY-TRIAL
+          COOKIE_INSECURE=true
+          IGNORE_CODE_EXECUTOR_STARTUP_CHECK=true
+          DOMAINS=localhost -> http://api:3000
+          BASE_DOMAIN=http://localhost:3000
+          WORKFLOW_TEMPORAL_CLUSTER_FRONTEND_HOST=temporal
+          WORKFLOW_TEMPORAL_CLUSTER_FRONTEND_PORT=7233
+          EOF
+
+      - name: Start Retool stack
+        working-directory: test/integration
+        run: docker compose up -d
+
+      - name: Wait for Retool, seed admin, mint API token
+        run: |
+          TOKEN=$(bash test/integration/setup.sh)
+          PGPW=$(grep '^POSTGRES_PASSWORD=' test/integration/docker.env | cut -d= -f2-)
+          {
+            echo "BATON_RETOOL_API_TOKEN=$TOKEN"
+            echo "BATON_RETOOL_API_BASE_URL=http://localhost:3000"
+            echo "BATON_CONNECTION_STRING=user=retool_internal_user password=$PGPW host=localhost port=5432 dbname=hammerhead_production sslmode=disable"
+          } >> "$GITHUB_ENV"
+
+      - name: Download Baton
+        uses: ConductorOne/github-workflows/actions/get-baton@v2
+
+      - name: Run sync
+        run: ./baton-retool
+
+      - name: Grant/Revoke group membership
+        uses: ConductorOne/github-workflows/actions/sync-test@v4
+        with:
+          connector: ./baton-retool
+          baton-entitlement: 'group:g2:member'
+          baton-principal: 'u1'
+          baton-principal-type: user
+
+      - name: Account provisioning (create -> delete -> dup-delete)
+        run: bash test/integration/provisioning-test.sh
+
+      - name: Dump Retool logs on failure
+        if: failure()
+        working-directory: test/integration
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        working-directory: test/integration
+        run: docker compose down -v

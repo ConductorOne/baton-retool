@@ -42,8 +42,10 @@ func getConnector(ctx context.Context, v *viper.Viper) (types.ConnectorServer, e
 	skipPages := v.GetBool(SkipPages.FieldName)
 	skipResources := v.GetBool(SkipResources.FieldName)
 	skipDisabledUsers := v.GetBool(SkipDisabledUsers.FieldName)
+	apiBaseURL := v.GetString(RetoolAPIBaseURL.FieldName)
+	apiToken := v.GetString(RetoolAPIToken.FieldName)
 
-	cb, err := connector.New(ctx, connString, skipPages, skipResources, skipDisabledUsers)
+	cb, err := connector.New(ctx, connString, skipPages, skipResources, skipDisabledUsers, apiBaseURL, apiToken)
 	if err != nil {
 		l.Error("error creating connector builder", zap.Error(err))
 		return nil, err

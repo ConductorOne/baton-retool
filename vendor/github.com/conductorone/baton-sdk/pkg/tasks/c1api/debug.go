@@ -2,6 +2,8 @@ package c1api
 
 import (
 	"context"
+
+	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
 type debugHandler struct {
@@ -13,6 +15,9 @@ func newStartDebugging(tm *c1ApiTaskManager) *debugHandler {
 }
 
 func (c *debugHandler) HandleTask(ctx context.Context) error {
-	c.taskmanager.runnerShouldDebug = true
+	_, span := tracer.Start(ctx, "debugHandler.HandleTask")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+	c.taskmanager.runnerShouldDebug.Store(true)
 	return nil
 }

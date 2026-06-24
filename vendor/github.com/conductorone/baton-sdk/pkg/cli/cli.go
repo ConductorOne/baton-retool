@@ -1,0 +1,401 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/csv"
+	"fmt"
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/field"
+	"github.com/conductorone/baton-sdk/pkg/types"
+	"github.com/conductorone/baton-sdk/pkg/types/sessions"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
+	"golang.org/x/oauth2"
+)
+
+type RunTimeOpts struct {
+	SessionStore        sessions.SessionStore
+	TokenSource         oauth2.TokenSource
+	SelectedAuthMethod  string
+	SyncResourceTypeIDs []string
+}
+
+// GetConnectorFunc is a function type that creates a connector instance.
+// It takes a context and configuration. The session cache constructor is retrieved from the context.
+type GetConnectorFunc[T field.Configurable] func(ctx context.Context, cfg T) (types.ConnectorServer, error)
+type GetConnectorFunc2[T field.Configurable] func(ctx context.Context, cfg T, runTimeOpts RunTimeOpts) (types.ConnectorServer, error)
+
+// WithSessionCache creates a session cache using the provided constructor and adds it to the context.
+func WithSessionCache(ctx context.Context, constructor sessions.SessionStoreConstructor) (context.Context, error) {
+	sessionCache, err := constructor(ctx)
+	if err != nil {
+		return ctx, fmt.Errorf("failed to create session cache: %w", err)
+	}
+	return context.WithValue(ctx, sessions.SessionStoreKey{}, sessionCache), nil
+}
+
+// ConnectorOpts holds runtime options passed to a connector at initialization time.
+type ConnectorOpts struct {
+	TokenSource        oauth2.TokenSource
+	SelectedAuthMethod string
+
+	// SyncResourceTypeIDs is the set of resource type IDs the user has requested
+	// to sync. An empty slice means "sync everything the connector advertises"
+	// (subject to OptInRequired{} annotations on resource types). A non-empty
+	// slice means "sync only these types; skip everything else." Connectors
+	// should prefer the helper methods (WillSyncResourceType,
+	// SyncFilterIsExplicit, SyncResourceTypeSet) over reading this slice
+	// directly.
+	SyncResourceTypeIDs []string
+
+	syncResourceTypeSetOnce sync.Once
+	syncResourceTypeSetVal  map[string]struct{}
+}
+
+// SyncFilterIsExplicit reports whether the user has explicitly narrowed the set
+// of resource types to sync. Returns false when SyncResourceTypeIDs is empty,
+// meaning "sync all types the connector advertises".
+func (o *ConnectorOpts) SyncFilterIsExplicit() bool {
+	return len(o.SyncResourceTypeIDs) > 0
+}
+
+// SyncResourceTypeSet returns the user's selection as a set for O(1) lookup,
+// or nil if no filter was specified (meaning all resource types should be
+// synced). The set is computed lazily on first call and cached for subsequent
+// calls.
+func (o *ConnectorOpts) SyncResourceTypeSet() map[string]struct{} {
+	if !o.SyncFilterIsExplicit() {
+		return nil
+	}
+	o.syncResourceTypeSetOnce.Do(func() {
+		s := make(map[string]struct{}, len(o.SyncResourceTypeIDs))
+		for _, id := range o.SyncResourceTypeIDs {
+			s[id] = struct{}{}
+		}
+		o.syncResourceTypeSetVal = s
+	})
+	return o.syncResourceTypeSetVal
+}
+
+// WillSyncResourceType reports whether the given resource type ID will be
+// synced under the current configuration. Returns true when the user has not
+// specified any filter (the "default to all" case).
+func (o *ConnectorOpts) WillSyncResourceType(resourceTypeID string) bool {
+	if !o.SyncFilterIsExplicit() {
+		return true
+	}
+	_, ok := o.SyncResourceTypeSet()[resourceTypeID]
+	return ok
+}
+
+type NewConnector[T field.Configurable] func(ctx context.Context, cfg T, opts *ConnectorOpts) (connectorbuilder.ConnectorBuilderV2, []connectorbuilder.Opt, error)
+
+func MakeGenericConfiguration[T field.Configurable](v *viper.Viper, opts ...field.DecodeHookOption) (T, error) {
+	// Create an instance of the struct type T using reflection
+	var config T // Create a zero-value instance of T
+
+	// Is it a *Viper?
+	if reflect.TypeOf(config) == reflect.TypeOf((*viper.Viper)(nil)) {
+		if t, ok := any(v).(T); ok {
+			return t, nil
+		}
+		return config, fmt.Errorf("cannot convert *viper.Viper to %T", config)
+	}
+
+	// Unmarshal into the config struct with any decode hook options provided
+	err := v.Unmarshal(&config, viper.DecodeHook(field.ComposeDecodeHookFunc(opts...)))
+	if err != nil {
+		return config, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	return config, nil
+}
+
+// NOTE(shackra): Set all values from Viper to the flags so...
+// that Cobra won't complain that a flag is missing in case we...
+// pass values through environment variables.
+func VisitFlags(cmd *cobra.Command, v *viper.Viper) {
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if !v.IsSet(f.Name) {
+			return
+		}
+
+		// v.GetString() mangles non-scalar types: YAML arrays become "[a b c]"
+		// and maps become "map[k:v]". Use type-appropriate getters so that
+		// pflag receives a properly formatted value for Set().
+		switch f.Value.Type() {
+		case "stringSlice":
+			switch v.Get(f.Name).(type) {
+			case []interface{}, []string:
+				// From YAML/config file: viper parsed individual elements.
+				// CSV-encode so pflag's readAsCSV() preserves values that
+				// contain commas (e.g. LDAP DNs like "OU=X,DC=Y").
+				ss := v.GetStringSlice(f.Name)
+				if len(ss) > 0 {
+					var buf bytes.Buffer
+					w := csv.NewWriter(&buf)
+					_ = w.Write(ss)
+					w.Flush()
+					_ = cmd.Flags().Set(f.Name, strings.TrimSuffix(buf.String(), "\n"))
+				}
+			default:
+				// From env var or other string source: pass the raw string
+				// to pflag so it splits on commas as expected.
+				_ = cmd.Flags().Set(f.Name, v.GetString(f.Name))
+			}
+		case "stringToString":
+			if hasNestedStringMapValue(v.Get(f.Name)) {
+				return
+			}
+			sm := v.GetStringMapString(f.Name)
+			if len(sm) > 0 {
+				// pflag expects "key=value" CSV format.
+				pairs := make([]string, 0, len(sm))
+				for k, val := range sm {
+					pairs = append(pairs, k+"="+val)
+				}
+				_ = cmd.Flags().Set(f.Name, strings.Join(pairs, ","))
+			}
+		default:
+			_ = cmd.Flags().Set(f.Name, v.GetString(f.Name))
+		}
+	})
+}
+
+func hasNestedStringMapValue(value any) bool {
+	rv := reflect.ValueOf(value)
+	if !rv.IsValid() || rv.Kind() != reflect.Map {
+		return false
+	}
+
+	for _, mapKey := range rv.MapKeys() {
+		mapValue := rv.MapIndex(mapKey)
+		for mapValue.IsValid() && mapValue.Kind() == reflect.Interface {
+			if mapValue.IsNil() {
+				break
+			}
+			mapValue = mapValue.Elem()
+		}
+		if !mapValue.IsValid() {
+			continue
+		}
+		kind := mapValue.Kind()
+		if kind == reflect.Map || kind == reflect.Slice || kind == reflect.Array || kind == reflect.Struct {
+			return true
+		}
+	}
+	return false
+}
+
+func AddCommand(mainCMD *cobra.Command, v *viper.Viper, schema *field.Configuration, subCMD *cobra.Command) (*cobra.Command, error) {
+	mainCMD.AddCommand(subCMD)
+	if schema != nil {
+		err := SetFlagsAndConstraints(subCMD, *schema)
+		if err != nil {
+			return nil, err
+		}
+	}
+	VisitFlags(subCMD, v)
+
+	return subCMD, nil
+}
+func SetFlagsAndConstraints(command *cobra.Command, schema field.Configuration) error {
+	// add options
+	for _, f := range schema.Fields {
+		switch f.Variant {
+		case field.BoolVariant:
+			value, err := field.GetDefaultValue[bool](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					BoolP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					BoolP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.IntVariant:
+			value, err := field.GetDefaultValue[int](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					IntP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					IntP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.StringVariant:
+			value, err := field.GetDefaultValue[string](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					StringP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+
+		case field.StringSliceVariant:
+			value, err := field.GetDefaultValue[[]string](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringSliceP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			} else {
+				command.Flags().
+					StringSliceP(f.FieldName, f.GetCLIShortHand(), *value, f.GetDescription())
+			}
+		case field.StringMapVariant:
+			value, err := field.GetDefaultValue[map[string]any](f)
+			if err != nil {
+				return fmt.Errorf(
+					"field %s, %s: %w",
+					f.FieldName,
+					f.Variant,
+					err,
+				)
+			}
+			strMap := make(map[string]string)
+			for k, v := range *value {
+				switch val := v.(type) {
+				case string:
+					strMap[k] = val
+				case int:
+					strMap[k] = fmt.Sprintf("%d", val)
+				case bool:
+					strMap[k] = fmt.Sprintf("%v", val)
+				case float64:
+					strMap[k] = fmt.Sprintf("%g", val)
+				default:
+					strMap[k] = fmt.Sprintf("%v", val)
+				}
+			}
+			if f.IsPersistent() {
+				command.PersistentFlags().
+					StringToStringP(f.FieldName, f.GetCLIShortHand(), strMap, f.GetDescription())
+			} else {
+				command.Flags().
+					StringToStringP(f.FieldName, f.GetCLIShortHand(), strMap, f.GetDescription())
+			}
+		default:
+			return fmt.Errorf(
+				"field %s, %s is not yet supported",
+				f.FieldName,
+				f.Variant,
+			)
+		}
+
+		// mark hidden
+		if f.IsHidden() {
+			if f.IsPersistent() {
+				err := command.PersistentFlags().MarkHidden(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot hide persistent field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			} else {
+				err := command.Flags().MarkHidden(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot hide field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			}
+		}
+
+		// mark required
+		if f.Required && len(schema.FieldGroups) == 0 {
+			if f.Variant == field.BoolVariant {
+				return fmt.Errorf("requiring %s of type %s does not make sense", f.FieldName, f.Variant)
+			}
+
+			if f.IsPersistent() {
+				err := command.MarkPersistentFlagRequired(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot require persistent field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			} else {
+				err := command.MarkFlagRequired(f.FieldName)
+				if err != nil {
+					return fmt.Errorf(
+						"cannot require field %s, %s: %w",
+						f.FieldName,
+						f.Variant,
+						err,
+					)
+				}
+			}
+		}
+	}
+
+	// apply constrains
+	for _, constrain := range schema.Constraints {
+		switch constrain.Kind {
+		case field.MutuallyExclusive:
+			command.MarkFlagsMutuallyExclusive(listFieldConstrainsAsStrings(constrain)...)
+		case field.RequiredTogether:
+			command.MarkFlagsRequiredTogether(listFieldConstrainsAsStrings(constrain)...)
+		case field.AtLeastOne:
+			command.MarkFlagsOneRequired(listFieldConstrainsAsStrings(constrain)...)
+		case field.Dependents:
+			// do nothing
+		default:
+			return fmt.Errorf("invalid config")
+		}
+	}
+
+	return nil
+}
+
+func listFieldConstrainsAsStrings(constrains field.SchemaFieldRelationship) []string {
+	var fields []string
+	for _, v := range constrains.Fields {
+		fields = append(fields, v.FieldName)
+	}
+
+	return fields
+}

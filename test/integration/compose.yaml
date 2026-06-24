@@ -1,0 +1,47 @@
+# Minimal self-hosted Retool stack for baton-retool integration testing.
+#
+# baton-retool is a local connector: it reads Retool's internal Postgres DB
+# (sync + group/page provisioning) and uses the Retool REST API for account
+# provisioning. There is no hosted endpoint to point CI at, so we stand up a
+# throwaway Retool here. Brought up by .github/workflows/integration-test.yaml.
+#
+# Only three services are needed: postgres (the DB the connector reads),
+# jobs-runner (applies the DB migrations), and api (web UI + REST API). The
+# workflow/temporal/code-executor services are intentionally omitted.
+#
+# docker.env (POSTGRES_PASSWORD / JWT_SECRET / ENCRYPTION_KEY) is generated at
+# runtime with throwaway values for this ephemeral DB — it is NOT committed.
+services:
+  postgres:
+    image: postgres:16.8
+    env_file: docker.env
+    command: -c 'max_connections=200'
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retool_internal_user -d hammerhead_production"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  jobs-runner:
+    image: tryretool/backend:${RETOOL_VERSION:-3.334.17-stable}
+    env_file: docker.env
+    environment:
+      - SERVICE_TYPE=JOBS_RUNNER
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  api:
+    image: tryretool/backend:${RETOOL_VERSION:-3.334.17-stable}
+    env_file: docker.env
+    environment:
+      - SERVICE_TYPE=MAIN_BACKEND,DB_CONNECTOR,DB_SSH_CONNECTOR
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure

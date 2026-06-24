@@ -65,6 +65,29 @@ func (u *UserModel) GetLastLoggedIn() time.Time {
 	return time.Time{}
 }
 
+// ErrUserNotFound is returned by GetUserSID when no user row matches the legacy id.
+var ErrUserNotFound = errors.New("user not found")
+
+// GetUserSID resolves a Postgres user id (the int64 that baton keys `user:<int64>` on,
+// surfaced as `legacy_id` over REST) to its stable `sid` (`user_<uuid>`), which is the id
+// every REST user endpoint addresses users by. Because the connector always holds the
+// Postgres pool, this is the robust int64->UUID join — no mutable-email lookup required.
+func (c *Client) GetUserSID(ctx context.Context, legacyID int64) (string, error) {
+	l := ctxzap.Extract(ctx)
+	l.Debug("resolving user sid", zap.Int64("legacy_id", legacyID))
+
+	var sid string
+	err := pgxscan.Get(ctx, c.db, &sid, `SELECT "sid" FROM users WHERE "id"=$1`, legacyID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || pgxscan.NotFound(err) {
+			return "", ErrUserNotFound
+		}
+		return "", err
+	}
+
+	return sid, nil
+}
+
 func (c *Client) ListUsersForOrg(ctx context.Context, orgID int64, pager *Pager, skipDisabledUsers bool) ([]*UserModel, string, error) {
 	l := ctxzap.Extract(ctx)
 	l.Debug("listing users for org", zap.Int64("org_id", orgID))
