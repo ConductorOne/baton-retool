@@ -62,7 +62,7 @@ func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, er
 				"user_type": {
 					DisplayName: "User Type",
 					Required:    false,
-					Description: "Retool user type: \"default\" (full platform user, billable) or \"endUser\". Defaults to \"default\".",
+					Description: "Retool user type: \"default\" (full platform user, billable), \"mobile\", or \"embed\". Defaults to \"default\".",
 					Placeholder: "default",
 					Order:       4,
 					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
