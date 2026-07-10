@@ -13,6 +13,9 @@ func formatObjectID(resourceTypeID string, id int64) string {
 }
 
 func parseObjectID(id string) (int64, error) {
+	if len(id) < 2 {
+		return 0, fmt.Errorf("invalid resource id: %q", id)
+	}
 	return strconv.ParseInt(id[1:], 10, 64)
 }
 
