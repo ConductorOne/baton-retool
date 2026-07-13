@@ -14,6 +14,15 @@ import (
 	"github.com/conductorone/baton-retool/pkg/client"
 )
 
+// validUserTypes are the only user_type values the Retool API accepts on account creation;
+// anything else is rejected with HTTP 400. Empty defers to the API's own default ("default").
+var validUserTypes = map[string]bool{
+	"":        true,
+	"default": true,
+	"mobile":  true,
+	"embed":   true,
+}
+
 func titleCase(s string) string {
 	titleCaser := cases.Title(language.English)
 

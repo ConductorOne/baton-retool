@@ -16,6 +16,8 @@ Check out [Baton](https://github.com/conductorone/baton) to learn more the proje
 
 > **Note on deprovisioning:** Retool's REST API has no hard delete — its `DELETE /users/{id}` endpoint only deactivates the account. The connector therefore models deprovisioning as the reversible **`disable_user`** action (blocks sign-in, keeps group memberships) with **`enable_user`** to reactivate, instead of an account Delete that would misrepresent a deactivation as a removal. Account provisioning requires the `retool-api-base-url` and `retool-api-token` settings; sync and group/page provisioning need only the `connection-string`.
 
+> **Note on `user_type`:** the account-creation form's optional `user_type` field accepts only `default` (full platform user, billable), `mobile`, or `embed` — any other value is rejected with `InvalidArgument` before it reaches the Retool API. Leave it blank to get Retool's own default (`default`).
+
 # Getting Started
 
 ## Setup

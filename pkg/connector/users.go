@@ -134,12 +134,16 @@ func (s *userSyncer) CreateAccount(
 	if firstName == "" || lastName == "" {
 		return nil, nil, nil, status.Error(codes.InvalidArgument, "baton-retool: first_name and last_name are required to create an account")
 	}
+	userType := stringFromProfile(profile, "user_type")
+	if !validUserTypes[userType] {
+		return nil, nil, nil, status.Errorf(codes.InvalidArgument, "baton-retool: user_type must be one of \"default\", \"mobile\", or \"embed\", got %q", userType)
+	}
 
 	user, annos, err := s.client.CreateUser(ctx, client.CreateUserParams{
 		Email:     email,
 		FirstName: firstName,
 		LastName:  lastName,
-		UserType:  stringFromProfile(profile, "user_type"),
+		UserType:  userType,
 	})
 	if err != nil {
 		// Idempotent: a user with this email already exists -> return it as success.
