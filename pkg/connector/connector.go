@@ -14,6 +14,15 @@ import (
 	"github.com/conductorone/baton-retool/pkg/client"
 )
 
+// validUserTypes are the only user_type values the Retool API accepts on account creation;
+// anything else is rejected with HTTP 400. Empty defers to the API's own default ("default").
+var validUserTypes = map[string]bool{
+	"":        true,
+	"default": true,
+	"mobile":  true,
+	"embed":   true,
+}
+
 func titleCase(s string) string {
 	titleCaser := cases.Title(language.English)
 
@@ -62,7 +71,7 @@ func (c *ConnectorImpl) Metadata(ctx context.Context) (*v2.ConnectorMetadata, er
 				"user_type": {
 					DisplayName: "User Type",
 					Required:    false,
-					Description: "Retool user type: \"default\" (full platform user, billable) or \"endUser\". Defaults to \"default\".",
+					Description: "Retool user type: \"default\" (full platform user, billable), \"mobile\", or \"embed\". Defaults to \"default\".",
 					Placeholder: "default",
 					Order:       4,
 					Field:       &v2.ConnectorAccountCreationSchema_Field_StringField{StringField: &v2.ConnectorAccountCreationSchema_StringField{}},
