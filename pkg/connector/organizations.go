@@ -6,7 +6,7 @@ import (
 
 	"github.com/conductorone/baton-sdk/pkg/annotations"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
-	_ "github.com/georgysavva/scany/pgxscan"
+	_ "github.com/georgysavva/scany/v2/pgxscan"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 
 	"github.com/conductorone/baton-retool/pkg/client"
