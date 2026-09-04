@@ -79,7 +79,7 @@ baton resources
 ## docker
 
 ```
-docker run --rm -v $(pwd):/out -e BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" ghcr.io/conductorone/baton-retool:latest -f "/out/sync.c1z"
+docker run --rm -v $(pwd):/out -e BATON_CONNECTION_STRING="user=baton password=baton host=localhost port=5432 dbname=hammerhead_production" public.ecr.aws/conductorone/baton-retool:latest -f "/out/sync.c1z"
 docker run --rm -v $(pwd):/out ghcr.io/conductorone/baton:latest -f "/out/sync.c1z" resources
 ```
 
