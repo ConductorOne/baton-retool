@@ -10,7 +10,7 @@ import (
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
 	"github.com/conductorone/baton-sdk/pkg/pagination"
 	resources "github.com/conductorone/baton-sdk/pkg/types/resource"
-	_ "github.com/georgysavva/scany/pgxscan"
+	_ "github.com/georgysavva/scany/v2/pgxscan"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
