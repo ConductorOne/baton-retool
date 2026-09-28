@@ -4,23 +4,23 @@ import (
 	"context"
 
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5/tracelog"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 type Logger struct{}
 
-func (log *Logger) Zap2PgxLogLevel(level zapcore.Level) pgx.LogLevel {
+func (log *Logger) Zap2PgxLogLevel(level zapcore.Level) tracelog.LogLevel {
 	switch level {
 	case zapcore.DebugLevel:
-		return pgx.LogLevelDebug
+		return tracelog.LogLevelDebug
 	case zapcore.InfoLevel:
-		return pgx.LogLevelWarn
+		return tracelog.LogLevelWarn
 	case zapcore.WarnLevel:
-		return pgx.LogLevelWarn
+		return tracelog.LogLevelWarn
 	case zapcore.ErrorLevel:
-		return pgx.LogLevelError
+		return tracelog.LogLevelError
 	case zapcore.DPanicLevel:
 		fallthrough
 	case zapcore.PanicLevel:
@@ -30,25 +30,25 @@ func (log *Logger) Zap2PgxLogLevel(level zapcore.Level) pgx.LogLevel {
 	case zapcore.InvalidLevel:
 		fallthrough
 	default:
-		return pgx.LogLevelError
+		return tracelog.LogLevelError
 	}
 }
 
-func (log *Logger) Pgx2ZapLogLevel(level pgx.LogLevel) zapcore.Level {
+func (log *Logger) Pgx2ZapLogLevel(level tracelog.LogLevel) zapcore.Level {
 	switch level {
-	case pgx.LogLevelDebug:
+	case tracelog.LogLevelDebug:
 		return zapcore.DebugLevel
-	case pgx.LogLevelInfo:
+	case tracelog.LogLevelInfo:
 		return zapcore.InfoLevel
-	case pgx.LogLevelWarn:
+	case tracelog.LogLevelWarn:
 		return zapcore.WarnLevel
-	case pgx.LogLevelError:
+	case tracelog.LogLevelError:
 		return zapcore.ErrorLevel
 	}
 	return zapcore.ErrorLevel
 }
 
-func (log *Logger) Log(ctx context.Context, level pgx.LogLevel, msg string, data map[string]interface{}) {
+func (log *Logger) Log(ctx context.Context, level tracelog.LogLevel, msg string, data map[string]interface{}) {
 	l := ctxzap.Extract(ctx)
 	l.Log(log.Pgx2ZapLogLevel(level), msg, zap.Reflect("data", data))
 }

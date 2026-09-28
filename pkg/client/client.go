@@ -9,7 +9,8 @@ import (
 
 	"github.com/conductorone/baton-sdk/pkg/uhttp"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/tracelog"
 )
 
 type Client struct {
@@ -50,15 +51,25 @@ func New(ctx context.Context, dsn string, apiBaseURL string, apiToken string) (*
 	}
 
 	logger := &Logger{}
-	config.ConnConfig.LogLevel = logger.Zap2PgxLogLevel(l.Level())
-	config.ConnConfig.Logger = logger
+	config.ConnConfig.Tracer = &tracelog.TraceLog{
+		Logger:   logger,
+		LogLevel: logger.Zap2PgxLogLevel(l.Level()),
+	}
 
 	if config.ConnConfig.Database == "" {
 		return nil, fmt.Errorf("must specify a database to connect to")
 	}
 
-	db, err := pgxpool.ConnectConfig(ctx, config)
+	db, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
+		return nil, err
+	}
+
+	// pgx v4's pgxpool.ConnectConfig established a connection eagerly (LazyConnect was
+	// opt-in); pgxpool v5 is always lazy. Ping to preserve the v4 behavior of surfacing
+	// connection/authentication errors at construction time.
+	if err := db.Ping(ctx); err != nil {
+		db.Close()
 		return nil, err
 	}
 
