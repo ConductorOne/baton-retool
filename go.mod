@@ -1,8 +1,6 @@
 module github.com/conductorone/baton-retool
 
-go 1.26.0
-
-toolchain go1.26.9
+go 1.27.3
 
 require (
 	github.com/conductorone/baton-sdk v0.13.0
@@ -51,7 +49,7 @@ require (
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
 	github.com/cockroachdb/pebble/v2 v2.1.5 // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
-	github.com/cockroachdb/swiss v0.0.0-20251224182025-b0f6560f979b // indirect
+	github.com/cockroachdb/swiss v0.0.0-20260820225851-aa852fb3c14e // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect
 	github.com/conductorone/dpop v0.2.6 // indirect
 	github.com/conductorone/dpop/integrations/dpop_grpc v0.2.4 // indirect
