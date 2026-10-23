@@ -24,6 +24,30 @@ type RunTimeOpts struct {
 	TokenSource         oauth2.TokenSource
 	SelectedAuthMethod  string
 	SyncResourceTypeIDs []string
+	// EgressPolicy carries the server-computed egress policy delivered on the
+	// connector-config response, when one is present. It is nil for connectors
+	// served without a policy envelope; the connector decides how (and whether)
+	// to enforce it.
+	EgressPolicy *EgressPolicy
+}
+
+// EgressPolicy is the connector-facing projection of a served-policy envelope's
+// egress section: the fields a connector runtime needs to enforce egress,
+// extracted after the SDK verified the envelope's binding to this response.
+// The envelope's digests, versions, and capability section are not surfaced —
+// they are the SDK's contract to verify, not the connector's.
+type EgressPolicy struct {
+	// AllowedHosts is the effective per-instance egress allowlist (canonical
+	// hostnames). A non-nil *EgressPolicy with empty AllowedHosts is a valid
+	// deny-all policy.
+	AllowedHosts []string
+	// HTTPSOnly reports whether the runtime must refuse non-https egress.
+	HTTPSOnly bool
+	// Enforce reports whether AllowedHosts is a deny-gate rather than an
+	// observed-and-reported allowlist. The wire carries an enum; narrowing it to
+	// a bool here keeps an unrecognized future posture from reaching a runtime
+	// that would have to guess at it — anything but an explicit enforce observes.
+	Enforce bool
 }
 
 // GetConnectorFunc is a function type that creates a connector instance.
@@ -53,6 +77,12 @@ type ConnectorOpts struct {
 	// SyncFilterIsExplicit, SyncResourceTypeSet) over reading this slice
 	// directly.
 	SyncResourceTypeIDs []string
+
+	// EgressPolicy carries the server-computed egress policy delivered on the
+	// connector-config response, when one is present. It is nil for connectors
+	// served without a policy envelope; the connector decides how (and whether)
+	// to enforce it.
+	EgressPolicy *EgressPolicy
 
 	syncResourceTypeSetOnce sync.Once
 	syncResourceTypeSetVal  map[string]struct{}

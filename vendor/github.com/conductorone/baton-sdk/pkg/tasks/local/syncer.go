@@ -10,10 +10,11 @@ import (
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	v1 "github.com/conductorone/baton-sdk/pb/c1/connectorapi/baton/v1"
-	"github.com/conductorone/baton-sdk/pkg/session"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	sdkSync "github.com/conductorone/baton-sdk/pkg/sync"
 	"github.com/conductorone/baton-sdk/pkg/tasks"
 	"github.com/conductorone/baton-sdk/pkg/types"
+	"github.com/conductorone/baton-sdk/pkg/types/sessions"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 	"github.com/conductorone/baton-sdk/pkg/uotel/uotelzap"
 )
@@ -24,11 +25,13 @@ type localSyncer struct {
 	tmpDir                              string
 	externalResourceC1Z                 string
 	externalResourceEntitlementIdFilter string
+	externalResourceTraits              []v2.ResourceType_Trait
 	targetedSyncResources               []*v2.Resource
 	skipEntitlementsAndGrants           bool
 	skipGrants                          bool
 	syncResourceTypeIDs                 []string
 	workerCount                         int
+	storageEngine                       c1zstore.Engine
 }
 
 type Option func(*localSyncer)
@@ -48,6 +51,12 @@ func WithExternalResourceC1Z(externalResourceC1Z string) Option {
 func WithExternalResourceEntitlementIdFilter(entitlementId string) Option {
 	return func(m *localSyncer) {
 		m.externalResourceEntitlementIdFilter = entitlementId
+	}
+}
+
+func WithExternalResourceTraits(traits []v2.ResourceType_Trait) Option {
+	return func(m *localSyncer) {
+		m.externalResourceTraits = traits
 	}
 }
 
@@ -81,6 +90,12 @@ func WithWorkerCount(workerCount int) Option {
 	}
 }
 
+func WithStorageEngine(engine c1zstore.Engine) Option {
+	return func(m *localSyncer) {
+		m.storageEngine = engine
+	}
+}
+
 func (m *localSyncer) GetTempDir() string {
 	return ""
 }
@@ -105,22 +120,23 @@ func (m *localSyncer) Process(ctx context.Context, task *v1.Task, cc types.Conne
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	var setSessionStore session.SetSessionStore
-	if ssetSessionStore, ok := cc.(session.SetSessionStore); ok {
-		setSessionStore = ssetSessionStore
-	}
-
 	syncOpts := []sdkSync.SyncOpt{
 		sdkSync.WithC1ZPath(m.dbPath),
 		sdkSync.WithTmpDir(m.tmpDir),
 		sdkSync.WithExternalResourceC1ZPath(m.externalResourceC1Z),
 		sdkSync.WithExternalResourceEntitlementIdFilter(m.externalResourceEntitlementIdFilter),
+		sdkSync.WithExternalResourceTraits(m.externalResourceTraits...),
 		sdkSync.WithTargetedSyncResources(m.targetedSyncResources),
 		sdkSync.WithSkipEntitlementsAndGrants(m.skipEntitlementsAndGrants),
 		sdkSync.WithSkipGrants(m.skipGrants),
-		sdkSync.WithSessionStore(setSessionStore),
 		sdkSync.WithSyncResourceTypes(m.syncResourceTypeIDs),
 		sdkSync.WithWorkerCount(m.workerCount),
+	}
+	if binder, ok := cc.(sessions.SessionStoreBinder); ok {
+		syncOpts = append(syncOpts, sdkSync.WithSessionStoreBinder(binder))
+	}
+	if m.storageEngine != "" {
+		syncOpts = append(syncOpts, sdkSync.WithStorageEngine(m.storageEngine))
 	}
 
 	syncer, err := sdkSync.NewSyncer(ctx, cc, syncOpts...)

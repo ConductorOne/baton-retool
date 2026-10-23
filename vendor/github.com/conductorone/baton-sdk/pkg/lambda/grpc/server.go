@@ -226,7 +226,7 @@ func PeerForRequest(req *Request) *peer.Peer {
 
 func TimeoutForRequest(req *Request) (time.Duration, bool, error) {
 	v := req.Headers().Get("grpc-timeout")
-	if len(v) > 1 {
+	if len(v) > 0 {
 		to, err := decodeTimeout(v[0])
 		if err != nil {
 			return 0, false, status.Errorf(codes.Internal, "malformed grpc-timeout: %v", err)
@@ -236,7 +236,18 @@ func TimeoutForRequest(req *Request) (time.Duration, bool, error) {
 	return 0, false, nil
 }
 
+// Handler serves one transport request. The response echoes the request's
+// wire version so v2 invokers get lossless frames and legacy invokers get
+// protojson (see Response.MarshalJSON).
 func (s *Server) Handler(ctx context.Context, req *Request) (*Response, error) {
+	resp, err := s.handle(ctx, req)
+	if resp != nil {
+		resp.wireV2 = req.wireV2
+	}
+	return resp, err
+}
+
+func (s *Server) handle(ctx context.Context, req *Request) (*Response, error) {
 	serviceName, methodName, err := parseMethod(req.Method())
 	if err != nil {
 		return ErrorResponse(err), nil

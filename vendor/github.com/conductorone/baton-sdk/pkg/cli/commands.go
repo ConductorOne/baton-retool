@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/types"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"github.com/maypok86/otter/v2"
@@ -44,6 +46,11 @@ import (
 const (
 	otelShutdownTimeout = 5 * time.Second
 )
+
+// eventLogEnabledKey marks the context when the user passed --log-event-log.
+// The flag is only registered on Windows; the Windows initLogger reads this
+// value to redirect logging to the Windows event log.
+type eventLogEnabledKey struct{}
 
 type ContrainstSetter func(*cobra.Command, field.Configuration) error
 
@@ -116,11 +123,22 @@ func MakeMainCommand[T field.Configurable](
 			return err
 		}
 
-		runCtx, err := initLogger(
-			ctx,
-			name,
+		logOpts := []logging.Option{
 			logging.WithLogFormat(v.GetString("log-format")),
 			logging.WithLogLevel(v.GetString("log-level")),
+		}
+		logPaths := v.GetStringSlice("log-path")
+		if len(logPaths) > 0 {
+			logOpts = append(logOpts, logging.WithOutputPaths(logPaths))
+		}
+		loggerCtx := ctx
+		if v.GetBool(field.LogEventLogFieldName) {
+			loggerCtx = context.WithValue(loggerCtx, eventLogEnabledKey{}, true)
+		}
+		runCtx, err := initLogger(
+			loggerCtx,
+			name,
+			logOpts...,
 		)
 		if err != nil {
 			return err
@@ -286,11 +304,12 @@ func MakeMainCommand[T field.Configurable](
 				}
 				opts = append(opts,
 					connectorrunner.WithActionsEnabled(),
-					connectorrunner.WithOnDemandInvokeAction(
+					connectorrunner.WithOnDemandInvokeActionWithCredentialPrinting(
 						v.GetString("file"),
 						v.GetString("invoke-action"),
 						v.GetString("invoke-action-resource-type"), // Optional resource type for resource-scoped actions
 						invokeActionArgsStruct,
+						v.GetBool("print-credentials"),
 					))
 			case v.GetBool("list-action-schemas"):
 				opts = append(opts,
@@ -331,14 +350,6 @@ func MakeMainCommand[T field.Configurable](
 				opts = append(opts,
 					connectorrunner.WithTicketingEnabled(),
 					connectorrunner.WithGetTicket(v.GetString("ticket-id")))
-			case v.GetBool("diff-syncs"):
-				opts = append(opts,
-					connectorrunner.WithDiffSyncs(
-						v.GetString("file"),
-						v.GetString("base-sync-id"),
-						v.GetString("applied-sync-id"),
-					),
-				)
 			case v.GetBool("compact-syncs"):
 				opts = append(opts,
 					connectorrunner.WithSyncCompactor(
@@ -391,6 +402,23 @@ func MakeMainCommand[T field.Configurable](
 			opts = append(opts, connectorrunner.WithExternalResourceEntitlementFilter(externalResourceEntitlementIdFilter))
 		}
 
+		if traitNames := v.GetStringSlice("external-resource-traits"); len(traitNames) > 0 {
+			traits, err := parseResourceTraits(traitNames)
+			if err != nil {
+				return err
+			}
+			opts = append(opts, connectorrunner.WithExternalResourceTraits(traits...))
+		}
+
+		// The customer's runtime half of the ETag-replay opt-in
+		// (--keep-previous-sync-c1z / BATON_KEEP_PREVIOUS_SYNC_C1Z).
+		// Only takes effect on connectors whose author also declared the
+		// capability at build time via
+		// connectorrunner.WithKeepPreviousSyncC1Z(); both are required.
+		if v.GetBool(field.KeepPreviousSyncC1ZField.GetName()) {
+			opts = append(opts, connectorrunner.WithKeepPreviousSyncC1ZRuntimeOptIn())
+		}
+
 		opts = append(opts, connectorrunner.WithSkipEntitlementsAndGrants(v.GetBool("skip-entitlements-and-grants")))
 
 		if v.GetBool("skip-grants") {
@@ -406,6 +434,15 @@ func MakeMainCommand[T field.Configurable](
 			return err
 		}
 		runCtx = context.WithValue(runCtx, uhttp.ContextHTTPTimeoutKey, time.Duration(httpTimeout)*time.Second)
+
+		storageEngine := v.GetString(field.StorageEngineField.GetName())
+		storageEngineField := field.StorageEngineField
+		if _, err := field.ValidateField(&storageEngineField, storageEngine); err != nil {
+			return err
+		}
+		if storageEngine != "" {
+			opts = append(opts, connectorrunner.WithStorageEngine(c1zstore.Engine(storageEngine)))
+		}
 
 		taskConcurrency := v.GetInt(field.TaskConcurrencyField.GetName())
 		taskConcurrencyField := field.TaskConcurrencyField
@@ -439,6 +476,28 @@ func MakeMainCommand[T field.Configurable](
 
 		return nil
 	}
+}
+
+// parseResourceTraits maps --external-resource-traits flag values to
+// ResourceType_Trait enum values. Accepts either the bare trait name
+// ("app", case-insensitive) or the canonical proto enum name ("TRAIT_APP").
+func parseResourceTraits(names []string) ([]v2.ResourceType_Trait, error) {
+	traits := make([]v2.ResourceType_Trait, 0, len(names))
+	for _, name := range names {
+		key := strings.ToUpper(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		if !strings.HasPrefix(key, "TRAIT_") {
+			key = "TRAIT_" + key
+		}
+		val, ok := v2.ResourceType_Trait_value[key]
+		if !ok {
+			return nil, fmt.Errorf("unknown external resource trait %q", name)
+		}
+		traits = append(traits, v2.ResourceType_Trait(val))
+	}
+	return traits, nil
 }
 
 func initOtel(ctx context.Context, name string, v *viper.Viper, initialLogFields map[string]interface{}) (context.Context, func(context.Context) error, error) {
@@ -536,6 +595,9 @@ func MakeGRPCServerCommand[T field.Configurable](
 		for scn.Scan() {
 			cfgStr = scn.Text()
 			break
+		}
+		if scn.Err() != nil {
+			return fmt.Errorf("failed to read stdin: %w", scn.Err())
 		}
 
 		cfgBytes, err := base64.StdEncoding.DecodeString(cfgStr)

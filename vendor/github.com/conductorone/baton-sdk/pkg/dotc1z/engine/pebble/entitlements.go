@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // PutEntitlementRecord writes an entitlement + its by_resource index.
@@ -18,120 +19,126 @@ func (e *Engine) PutEntitlementRecord(ctx context.Context, r *v3.EntitlementReco
 	return e.PutEntitlementRecords(ctx, r)
 }
 
-// PutEntitlementRecords writes N entitlements in two pebble.Batches
-// — primary keys in one, by_resource index keys in the other.
-// Mirrors the PutGrantRecords pattern (RFC §3a Tier-B/C):
-//   - within-call dedup pre-pass keyed by (sync, external_id) drops
-//     earlier occurrences;
-//   - the first PutEntitlementRecords call of a fresh sync skips
-//     the read-before-write Get (keyspace provably empty);
-//   - subsequent calls fall back to read-before-write so cross-call
-//     duplicates can clean up the prior call's index entries.
+// PutEntitlementRecords writes N entitlements by structured primary key.
+// The identity key is a pure function of the record (it contains the raw
+// external id), so overwrites are idempotent; a within-call dedup
+// pre-pass keeps last-wins semantics for same-identity duplicates in one
+// batch.
+//
+// Read-before-write exists ONLY for the by_source_scope obligation: an
+// overwrite that changes a row's scope stamp must clean the prior
+// entry, and entitlement scope entries are value-derived. The Get is
+// therefore skipped while rawdb's sourceScopeMayExist gate is unarmed:
+// the unarmed gate certifies no index entry exists to clean (the only
+// thing the prior value is fetched for), so an ordinary unscoped sync
+// pays no per-row read at all — the pre-scope write cost, exactly. A
+// stamped record still gets its index entry (stageSourceScopeChange
+// always scans the NEW value and arms the gate AT STAGING, before the
+// batch commits), so later records in the same call — and every call
+// after — take the Get path. Rows staged Get-free earlier in the
+// arming call are sound: the gate was unarmed when they staged, so no
+// committed index entry existed for their identities (db.Get cannot
+// see in-batch writes either way).
 func (e *Engine) PutEntitlementRecords(ctx context.Context, records ...*v3.EntitlementRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
 	return e.withWrite(func() error {
-		priBatch := e.db.NewBatch()
+		if err := e.requireCurrentSync(); err != nil {
+			return err
+		}
+		priBatch := e.db.NewRecordBatch()
 		defer priBatch.Close()
-		idxBatch := e.db.NewBatch()
-		defer idxBatch.Close()
 
-		fresh := e.IsFreshSync()
-		skipGet := e.takeFreshEntitlementsEmpty()
-
-		type dedupKey struct {
-			syncID, extID string
+		if _, err := e.stageEntitlementRecords(priBatch, records); err != nil {
+			return err
 		}
-		var dedup map[dedupKey]int
-		if len(records) > 1 {
-			dedup = make(map[dedupKey]int, len(records))
-			for i, r := range records {
-				if r == nil {
-					continue
-				}
-				dedup[dedupKey{r.GetSyncId(), r.GetExternalId()}] = i
-			}
+		opts := recordWriteOpts
+		if err := priBatch.Commit(opts); err != nil {
+			return err
 		}
+		e.noteEntitlementKeyspaceWrite()
+		return nil
+	})
+}
 
-		var (
-			lastSyncIDStr string
-			lastIDBytes   []byte
-			haveLast      bool
-		)
+// Caller holds the write barrier, commits the batch, and then calls
+// noteEntitlementKeyspaceWrite.
+func (e *Engine) stageEntitlementRecords(batch *rawdb.RecordBatch, records []*v3.EntitlementRecord) (uint64, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+	skipGet := e.takeFreshEntitlementsEmpty()
+
+	type dedupKey struct {
+		id entitlementIdentity
+	}
+	var dedup map[dedupKey]int
+	if len(records) > 1 {
+		dedup = make(map[dedupKey]int, len(records))
 		for i, r := range records {
 			if r == nil {
 				continue
 			}
-			if dedup != nil {
-				if dedup[dedupKey{r.GetSyncId(), r.GetExternalId()}] != i {
-					continue
-				}
-			}
-			var (
-				idBytes []byte
-				err     error
-			)
-			if sid := r.GetSyncId(); haveLast && sid == lastSyncIDStr {
-				idBytes = lastIDBytes
-			} else {
-				idBytes, err = e.resolveSyncBytes(sid)
-				if err != nil {
-					return err
-				}
-				lastSyncIDStr = sid
-				lastIDBytes = idBytes
-				haveLast = true
-			}
-			key := encodeEntitlementKey(idBytes, r.GetExternalId())
-			val, err := marshalRecord(r)
+			id, err := entitlementIdentityFromRecord(r)
 			if err != nil {
-				return err
+				return 0, err
 			}
-			if !skipGet {
-				oldVal, closer, getErr := e.db.Get(key)
-				switch {
-				case getErr == nil:
-					old := &v3.EntitlementRecord{}
-					if err := unmarshalRecord(oldVal, old); err != nil {
-						closer.Close()
-						return fmt.Errorf("PutEntitlementRecords: unmarshal old %q: %w", r.GetExternalId(), err)
-					}
-					if err := e.deleteEntitlementIndexes(idxBatch, idBytes, old); err != nil {
-						closer.Close()
-						return err
-					}
-					closer.Close()
-				case errors.Is(getErr, pebble.ErrNotFound):
-					// no prior — write unconditionally
-				default:
-					return fmt.Errorf("PutEntitlementRecords: get old: %w", getErr)
-				}
-			}
-			if err := priBatch.Set(key, val, nil); err != nil {
-				return err
-			}
-			if err := e.writeEntitlementIndexes(idxBatch, idBytes, r); err != nil {
-				return err
+			dedup[dedupKey{id}] = i
+		}
+	}
+
+	var staged uint64
+	for i, r := range records {
+		if r == nil {
+			continue
+		}
+		id, err := entitlementIdentityFromRecord(r)
+		if err != nil {
+			return 0, err
+		}
+		if dedup != nil {
+			if dedup[dedupKey{id}] != i {
+				continue
 			}
 		}
-		opts := writeOpts(e.opts.durability)
-		if fresh {
-			opts = pebble.NoSync
+		staged++
+		key := encodeEntitlementIdentityKey(id)
+		val, err := marshalRecord(r)
+		if err != nil {
+			return 0, err
 		}
-		if err := priBatch.Commit(opts); err != nil {
-			return err
+		if skipGet || !e.db.SourceScopeMayExist() {
+			if err := batch.StageEntitlementPut(key, val, nil); err != nil {
+				return 0, err
+			}
+			continue
 		}
-		return idxBatch.Commit(opts)
-	})
+		oldVal, closer, getErr := e.db.Get(key)
+		switch {
+		case getErr == nil:
+			err = batch.StageEntitlementPut(key, val, oldVal)
+			closer.Close()
+		case errors.Is(getErr, pebble.ErrNotFound):
+			err = batch.StageEntitlementPut(key, val, nil)
+		default:
+			return 0, fmt.Errorf("PutEntitlementRecords: get old: %w", getErr)
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	return staged, nil
 }
 
-func (e *Engine) GetEntitlementRecord(ctx context.Context, syncID, externalID string) (*v3.EntitlementRecord, error) {
-	idBytes, err := e.resolveSyncBytes(syncID)
+// GetEntitlementRecord fetches an entitlement by its raw public id via the
+// bare-id lookup (exact string-match, exactly-one rule — see lookup.go).
+func (e *Engine) GetEntitlementRecord(ctx context.Context, externalID string) (*v3.EntitlementRecord, error) {
+	id, err := e.resolveEntitlementIdentityByExternalID(ctx, externalID)
 	if err != nil {
 		return nil, err
 	}
-	val, closer, err := e.db.Get(encodeEntitlementKey(idBytes, externalID))
+	val, closer, err := e.db.Get(encodeEntitlementIdentityKey(id))
 	if err != nil {
 		return nil, err
 	}
@@ -143,71 +150,144 @@ func (e *Engine) GetEntitlementRecord(ctx context.Context, syncID, externalID st
 	return r, nil
 }
 
-func (e *Engine) DeleteEntitlementRecord(ctx context.Context, syncID, externalID string) error {
+// DeleteEntitlementRecord deletes by raw public id. A missing id is a
+// no-op; an ambiguous id is an error (a lossy string must never guess a
+// delete).
+func (e *Engine) DeleteEntitlementRecord(ctx context.Context, externalID string) error {
 	return e.withWrite(func() error {
-		idBytes, err := e.resolveSyncBytes(syncID)
-		if err != nil {
-			return err
-		}
-		key := encodeEntitlementKey(idBytes, externalID)
-		batch := e.db.NewBatch()
-		defer batch.Close()
-		oldVal, closer, err := e.db.Get(key)
+		id, err := e.resolveEntitlementIdentityByExternalID(ctx, externalID)
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				return nil
 			}
 			return err
 		}
-		old := &v3.EntitlementRecord{}
-		if err := unmarshalRecord(oldVal, old); err != nil {
-			closer.Close()
-			return fmt.Errorf("DeleteEntitlementRecord: unmarshal old %q: %w", externalID, err)
+		key := encodeEntitlementIdentityKey(id)
+		oldVal, closer, getErr := e.db.Get(key)
+		if errors.Is(getErr, pebble.ErrNotFound) {
+			return nil
 		}
-		if err := e.deleteEntitlementIndexes(batch, idBytes, old); err != nil {
+		if getErr != nil {
+			return getErr
+		}
+		batch := e.db.NewRecordBatch()
+		defer batch.Close()
+		if err := batch.StageEntitlementDelete(key, oldVal); err != nil {
 			closer.Close()
 			return err
 		}
 		closer.Close()
-		if err := batch.Delete(key, nil); err != nil {
+		if err := batch.Commit(writeOpts(e.opts.durability)); err != nil {
 			return err
 		}
-		return batch.Commit(writeOpts(e.opts.durability))
+		e.noteEntitlementKeyspaceWrite()
+		return nil
 	})
 }
 
-func (e *Engine) writeEntitlementIndexes(batch *pebble.Batch, syncIDBytes []byte, r *v3.EntitlementRecord) error {
-	res := r.GetResource()
-	if res == nil || res.GetResourceId() == "" {
+// DeleteEntitlementRecordByIdentity deletes one exact structured identity.
+// Unlike the compatibility bare-ID delete, it remains unambiguous when two
+// resources expose the same entitlement ID and requires no global lookup.
+func (e *Engine) DeleteEntitlementRecordByIdentity(
+	ctx context.Context,
+	resourceTypeID string,
+	resourceID string,
+	externalID string,
+) error {
+	return e.withWrite(func() error {
+		key := encodeEntitlementIdentityKey(
+			entitlementIdentityFromParts(resourceTypeID, resourceID, externalID),
+		)
+		// A missing row stages nothing, matching the bare-ID delete above and the
+		// grant path's rule: staging unconditionally would emit index and digest
+		// obligations for identities that never existed.
+		oldVal, closer, err := e.db.Get(key)
+		if errors.Is(err, pebble.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer closer.Close()
+		batch := e.db.NewRecordBatch()
+		defer batch.Close()
+		if err := batch.StageEntitlementDelete(key, oldVal); err != nil {
+			return err
+		}
+		if err := batch.Commit(writeOpts(e.opts.durability)); err != nil {
+			return err
+		}
+		e.noteEntitlementKeyspaceWrite()
 		return nil
-	}
-	k := encodeEntitlementByResourceIndexKey(
-		syncIDBytes,
-		res.GetResourceTypeId(), res.GetResourceId(),
-		r.GetExternalId(),
-	)
-	return batch.Set(k, nil, nil)
+	})
 }
 
-func (e *Engine) deleteEntitlementIndexes(batch *pebble.Batch, syncIDBytes []byte, r *v3.EntitlementRecord) error {
-	res := r.GetResource()
-	if res == nil || res.GetResourceId() == "" {
-		return nil
-	}
-	k := encodeEntitlementByResourceIndexKey(
-		syncIDBytes,
-		res.GetResourceTypeId(), res.GetResourceId(),
-		r.GetExternalId(),
-	)
-	return batch.Delete(k, nil)
+// DeleteEntitlementRecords validates every public id before staging any
+// tombstone, then commits the resolved deletes in bounded chunks (deletion
+// is idempotent; a mid-way error retries convergently). Missing ids are
+// no-ops; an ambiguous id rejects the entire request. actingScope is the
+// scope on whose behalf the tombstones act: deleting that scope's own rows
+// stages no poison, while deleting a row stamped with any OTHER scope
+// poisons it (CO-015); "" acts unscoped and poisons any stamped delete.
+func (e *Engine) DeleteEntitlementRecords(ctx context.Context, externalIDs []string, actingScope string) error {
+	return e.withWrite(func() error {
+		identities := make([]entitlementIdentity, 0, len(externalIDs))
+		seen := make(map[entitlementIdentity]struct{}, len(externalIDs))
+		for _, externalID := range externalIDs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			id, err := e.resolveEntitlementIdentityByExternalID(ctx, externalID)
+			if err != nil {
+				if errors.Is(err, pebble.ErrNotFound) {
+					continue
+				}
+				return err
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			identities = append(identities, id)
+		}
+		if len(identities) == 0 {
+			return nil
+		}
+
+		deletes := newSourceCacheDeleteBatch(e, "entitlements-canonical", actingScope, writeOpts(e.opts.durability))
+		defer deletes.close()
+		// The bare-id lookup map must observe every chunk AS it lands,
+		// not on function exit: entitlementIdentitiesForExternalID takes
+		// only entIDLookupMu, so a concurrent lookup between a mid-loop
+		// chunk commit and this function's return would serve a cached
+		// map listing rows already deleted on disk. The per-commit hook
+		// (an atomic add) closes that window and covers the
+		// error-after-intermediate-commit case for free.
+		deletes.onCommit = e.noteEntitlementKeyspaceWrite
+		for _, id := range identities {
+			key := encodeEntitlementIdentityKey(id)
+			oldVal, closer, err := e.db.Get(key)
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := deletes.batch.StageEntitlementDelete(key, oldVal); err != nil {
+				_ = closer.Close()
+				return err
+			}
+			_ = closer.Close()
+			if err := deletes.staged(true); err != nil {
+				return err
+			}
+		}
+		return deletes.commit(true)
+	})
 }
 
-func (e *Engine) IterateEntitlementsBySync(ctx context.Context, syncID string, yield func(*v3.EntitlementRecord) bool) error {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return err
-	}
-	prefix := encodeEntitlementPrefix(idBytes)
+func (e *Engine) IterateEntitlements(ctx context.Context, yield func(*v3.EntitlementRecord) bool) error {
+	prefix := encodeEntitlementPrefix()
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: upperBoundOf(prefix),
@@ -228,12 +308,8 @@ func (e *Engine) IterateEntitlementsBySync(ctx context.Context, syncID string, y
 	return iter.Error()
 }
 
-func (e *Engine) IterateEntitlementsByResource(ctx context.Context, syncID, resourceTypeID, resourceID string, yield func(*v3.EntitlementRecord) bool) error {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return err
-	}
-	indexPrefix := encodeEntitlementByResourcePrefix(idBytes, resourceTypeID, resourceID)
+func (e *Engine) IterateEntitlementsByResource(ctx context.Context, resourceTypeID, resourceID string, yield func(*v3.EntitlementRecord) bool) error {
+	indexPrefix := encodeEntitlementPrimaryResourcePrefix(resourceTypeID, resourceID)
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: indexPrefix,
 		UpperBound: upperBoundOf(indexPrefix),
@@ -243,21 +319,8 @@ func (e *Engine) IterateEntitlementsByResource(ctx context.Context, syncID, reso
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		externalID := lastTupleComponent(iter.Key(), indexPrefix)
-		if externalID == "" {
-			continue
-		}
-		val, closer, err := e.db.Get(encodeEntitlementKey(idBytes, externalID))
-		if err != nil {
-			if errors.Is(err, pebble.ErrNotFound) {
-				continue
-			}
-			return err
-		}
 		r := &v3.EntitlementRecord{}
-		err = unmarshalRecord(val, r)
-		closer.Close()
-		if err != nil {
+		if err := unmarshalRecord(iter.Value(), r); err != nil {
 			return err
 		}
 		if !yield(r) {

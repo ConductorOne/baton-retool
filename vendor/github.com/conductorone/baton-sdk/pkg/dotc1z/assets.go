@@ -11,6 +11,7 @@ import (
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
@@ -86,7 +87,7 @@ func (c *C1File) PutAsset(ctx context.Context, assetRef *v2.AssetRef, contentTyp
 		"content_type":  contentType,
 		"data":          data,
 		"sync_id":       c.currentSyncID,
-		"discovered_at": time.Now().Format("2006-01-02 15:04:05.999999999"),
+		"discovered_at": time.Now().Format(sqliteTimeFormat),
 	}
 
 	q := c.db.Insert(assets.Name()).Prepared(true)
@@ -103,7 +104,7 @@ func (c *C1File) PutAsset(ctx context.Context, assetRef *v2.AssetRef, contentTyp
 		return err
 	}
 
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	return nil
 }
@@ -143,7 +144,7 @@ func (c *C1File) GetAsset(ctx context.Context, request *v2.AssetServiceGetAssetR
 	row := c.db.QueryRowContext(ctx, query, args...)
 	err = row.Scan(&contentType, &data)
 	if err != nil {
-		return "", nil, err
+		return "", nil, c1zstore.AdaptNotFound(err)
 	}
 
 	out := bytes.NewBuffer(data)

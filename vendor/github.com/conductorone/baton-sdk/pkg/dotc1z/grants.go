@@ -3,12 +3,15 @@ package dotc1z
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/doug-martin/goqu/v9"
+	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
@@ -135,7 +138,7 @@ func (c *C1File) ListGrants(ctx context.Context, request *v2.GrantsServiceListGr
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request)
+	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request, false)
 	if err != nil {
 		return nil, fmt.Errorf("error listing grants: %w", err)
 	}
@@ -146,9 +149,35 @@ func (c *C1File) ListGrants(ctx context.Context, request *v2.GrantsServiceListGr
 	}.Build(), nil
 }
 
+// ListGrantsWithExpansion is ListGrants that also re-attaches each grant's
+// GrantExpandable annotation, which PutGrants strips into the `expansion` side
+// column on write. Plain ListGrants reads only the data blob and so drops the
+// expansion topology; a faithful copy/sanitize over the paginated read path
+// (which must keep ListGrants' resumable page-cursor semantics rather than
+// switch to StreamGrants) uses this instead. Implements
+// connectorstore.ExpansionGrantLister.
+func (c *C1File) ListGrantsWithExpansion(ctx context.Context, request *v2.GrantsServiceListGrantsRequest) (*v2.GrantsServiceListGrantsResponse, error) {
+	ctx, span := tracer.Start(ctx, "C1File.ListGrantsWithExpansion")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
+	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request, true)
+	if err != nil {
+		return nil, fmt.Errorf("error listing grants with expansion: %w", err)
+	}
+
+	return v2.GrantsServiceListGrantsResponse_builder{
+		List:          ret,
+		NextPageToken: nextPageToken,
+	}.Build(), nil
+}
+
 // listGrantsGeneric pulls the grant identity columns inline so slim-blob
-// rows can be hydrated without a second query.
-func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.Grant, string, error) {
+// rows can be hydrated without a second query. When includeExpansion is set it
+// also selects the side `expansion` column and re-attaches each grant's
+// GrantExpandable annotation (stripped on write); default false keeps the
+// data-only read byte-identical for existing callers.
+func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest, includeExpansion bool) ([]*v2.Grant, string, error) {
 	if err := c.validateDb(ctx); err != nil {
 		return nil, "", err
 	}
@@ -159,7 +188,7 @@ func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.G
 	}
 
 	tableName := grants.Name()
-	q := c.db.From(tableName).Prepared(true).Select(
+	selectCols := []interface{}{
 		"id",
 		"data",
 		"entitlement_id",
@@ -167,7 +196,13 @@ func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.G
 		"resource_id",
 		"principal_resource_type_id",
 		"principal_resource_id",
-	)
+	}
+	if includeExpansion {
+		// The serialized GrantExpandable lives in a side column (stripped from
+		// data on write); pull it so we can re-attach it.
+		selectCols = append(selectCols, "expansion")
+	}
+	q := c.db.From(tableName).Prepared(true).Select(selectCols...)
 
 	// Filter predicates — mirrors listConnectorObjects.
 	if resourceTypeReq, ok := req.(hasResourceTypeListRequest); ok {
@@ -251,15 +286,21 @@ func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.G
 		entRRaw        sql.RawBytes
 		principalRTRaw sql.RawBytes
 		principalRRaw  sql.RawBytes
+		expansionRaw   sql.RawBytes
 		count          uint32
 		lastRow        int64
+		reattached     int
 	)
+	scanDest := []any{&rowID, &data, &entIDRaw, &entRTRaw, &entRRaw, &principalRTRaw, &principalRRaw}
+	if includeExpansion {
+		scanDest = append(scanDest, &expansionRaw)
+	}
 	for rows.Next() {
 		count++
 		if count > pageSize {
 			break
 		}
-		if err := rows.Scan(&rowID, &data, &entIDRaw, &entRTRaw, &entRRaw, &principalRTRaw, &principalRRaw); err != nil {
+		if err := rows.Scan(scanDest...); err != nil {
 			return nil, "", err
 		}
 		lastRow = rowID
@@ -267,6 +308,15 @@ func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.G
 		g := &v2.Grant{}
 		if err := unmarshal.Unmarshal(data, g); err != nil {
 			return nil, "", err
+		}
+		if includeExpansion {
+			attached, err := reattachExpansion(g, expansionRaw)
+			if err != nil {
+				return nil, "", err
+			}
+			if attached {
+				reattached++
+			}
 		}
 		out = append(out, g)
 		if g.GetEntitlement() == nil || g.GetPrincipal() == nil {
@@ -286,6 +336,13 @@ func listGrantsGeneric(ctx context.Context, c *C1File, req listRequest) ([]*v2.G
 
 	if len(slimGrants) > 0 {
 		hydrateGrants(slimGrants, slimKeys)
+	}
+
+	if includeExpansion {
+		ctxzap.Extract(ctx).Debug("c1z: listed grants with expansion re-attached",
+			zap.Int("grants", len(out)),
+			zap.Int("expansion_reattached", reattached),
+		)
 	}
 
 	nextPageToken := ""
@@ -355,6 +412,13 @@ func (c *C1File) resolveSyncIDForGrantGet(ctx context.Context, explicit string) 
 	return latestSyncRun.ID, nil
 }
 
+// GrantsForEntitlementPrincipalSorted reports false: the SQLite engine orders
+// ListGrantsForEntitlement results by grant id, not by principal. The grant
+// expander uses this to fall back to its buffering/sorting path; only the
+// Pebble engine (whose primary grant key is entitlement/principal-keyed) reports
+// true.
+func (c *C1File) GrantsForEntitlementPrincipalSorted() bool { return false }
+
 func (c *C1File) ListGrantsForEntitlement(
 	ctx context.Context,
 	request *reader_v2.GrantsReaderServiceListGrantsForEntitlementRequest,
@@ -362,7 +426,7 @@ func (c *C1File) ListGrantsForEntitlement(
 	ctx, span := tracer.Start(ctx, "C1File.ListGrantsForEntitlement")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
-	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request)
+	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request, false)
 	if err != nil {
 		return nil, fmt.Errorf("error listing grants for entitlement '%s': %w", request.GetEntitlement().GetId(), err)
 	}
@@ -375,18 +439,28 @@ func (c *C1File) ListGrantsForEntitlement(
 
 func (c *C1File) ListGrantsForPrincipal(
 	ctx context.Context,
-	request *reader_v2.GrantsReaderServiceListGrantsForEntitlementRequest,
-) (*reader_v2.GrantsReaderServiceListGrantsForEntitlementResponse, error) {
+	request *reader_v2.GrantsReaderServiceListGrantsForPrincipalRequest,
+) (*reader_v2.GrantsReaderServiceListGrantsForPrincipalResponse, error) {
 	ctx, span := tracer.Start(ctx, "C1File.ListGrantsForPrincipal")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request)
-	if err != nil {
-		return nil, fmt.Errorf("error listing grants for principal '%s': %w", request.GetPrincipalId(), err) //nolint:staticcheck // ignore deprecated field
+	// The proto marks principal_id required, but protovalidate only runs
+	// behind a gRPC interceptor — in-process callers reach here directly,
+	// and without a principal filter listGrantsGeneric would page the
+	// entire grants table. Mirrors the Pebble adapter's guard.
+	principal := request.GetPrincipalId()
+	if principal == nil || principal.GetResource() == "" {
+		err = errors.New("ListGrantsForPrincipal: missing principal_id")
+		return nil, err
 	}
 
-	return reader_v2.GrantsReaderServiceListGrantsForEntitlementResponse_builder{
+	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request, false)
+	if err != nil {
+		return nil, fmt.Errorf("error listing grants for principal '%s': %w", request.GetPrincipalId(), err)
+	}
+
+	return reader_v2.GrantsReaderServiceListGrantsForPrincipalResponse_builder{
 		List:          ret,
 		NextPageToken: nextPageToken,
 	}.Build(), nil
@@ -400,7 +474,7 @@ func (c *C1File) ListGrantsForResourceType(
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request)
+	ret, nextPageToken, err := listGrantsGeneric(ctx, c, request, false)
 	if err != nil {
 		return nil, fmt.Errorf("error listing grants for resource type '%s': %w", request.GetResourceTypeId(), err)
 	}
@@ -440,7 +514,7 @@ func (c *C1File) upsertGrants(ctx context.Context, opts grantUpsertOptions, bulk
 		return err
 	}
 
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 	return nil
 }
 
@@ -471,7 +545,7 @@ var (
 //
 // InsertResourceGrants — the syncer extracts grant.Entitlement.Resource
 // and writes it to v1_resources via PutResources. Stubs would overwrite
-// the resources table with stripped data on etag-replay.
+// the resources table with stripped data.
 //
 // ExternalResourceMatch{All,Match,ID} — processGrantsWithExternalPrincipals
 // builds a bid key from grant.GetPrincipal() that encodes ParentResourceId.
@@ -637,6 +711,26 @@ func extractAndStripExpansion(grant *v2.Grant) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// reattachExpansion deserializes the GrantExpandable bytes that the SQLite
+// writer stripped into the side `expansion` column (see extractAndStripExpansion)
+// and re-attaches it as an annotation on g. It is the read-side inverse of the
+// write-side strip, shared by the StreamGrants IncludeExpansion path and the
+// ListGrants expansion-reattach path so both restore topology identically.
+// Empty expansion is a no-op. Returns true when an annotation was attached.
+func reattachExpansion(g *v2.Grant, expansion []byte) (bool, error) {
+	if len(expansion) == 0 {
+		return false, nil
+	}
+	expandable := &v2.GrantExpandable{}
+	if err := proto.Unmarshal(expansion, expandable); err != nil {
+		return false, err
+	}
+	annos := annotations.Annotations(g.GetAnnotations())
+	annos.Update(expandable)
+	g.SetAnnotations(annos)
+	return true, nil
 }
 
 func backfillGrantExpansionColumn(ctx context.Context, db *goqu.Database, tableName string) (bool, error) {

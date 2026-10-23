@@ -18,12 +18,10 @@ import (
 // treated as abandoned, not a live read target.
 const unfinishedSyncMaxAge = 7 * 24 * time.Hour
 
-// PutSyncRunRecord — one row per sync. sync_id is the only PK
-// component; the record reads/writes use only the sync_id.
-//
-// Unlike other writer methods this does NOT consult resolveSyncBytes
-// fallback — a SyncRunRecord must always carry its own sync_id (since
-// it's *defining* what's a valid sync, not operating under one).
+// PutSyncRunRecord writes the file's single sync-run record at the
+// fixed sync-run key. The sync_id lives in the record value (the only
+// place a sync_id is stored — never in a key), and must be non-empty
+// since this record is *defining* what counts as a valid sync.
 func (e *Engine) PutSyncRunRecord(ctx context.Context, r *v3.SyncRunRecord) error {
 	if r == nil {
 		return errors.New("PutSyncRunRecord: nil record")
@@ -31,16 +29,22 @@ func (e *Engine) PutSyncRunRecord(ctx context.Context, r *v3.SyncRunRecord) erro
 	if r.GetSyncId() == "" {
 		return errors.New("PutSyncRunRecord: empty sync_id")
 	}
-	return e.withWrite(func() error {
-		idBytes, err := e.resolveSyncBytes(r.GetSyncId())
-		if err != nil {
-			return err
-		}
+	// AllowSealed: sync-run metadata is legitimately stamped on a finished
+	// sync — ToPebble preserves the source ended_at, the sanitizer applies
+	// supports_diff, and the compactor renames the folded sync — all after
+	// EndSync sealed the engine.
+	return e.withWriteAllowSealed(func() error {
 		val, err := marshalRecord(r)
 		if err != nil {
 			return err
 		}
-		return e.db.Set(encodeSyncRunKey(idBytes), val, writeOpts(e.opts.durability))
+		// writeOpts, not recordWriteOpts. The crash-image tests (pkg/sync
+		// TestChaosConnectorLostResponseThenFilesystemFailureResumes,
+		// errorfs_sweep_test.go) reopen a mid-sync CrashClone and need
+		// the shared WAL to hold at least the last checkpoint; this fsync
+		// is what pushes it there. NoSync here makes those assertions
+		// depend on how much the OS happened to flush.
+		return e.db.MetaSet(encodeSyncRunKey(), val, writeOpts(e.opts.durability))
 	})
 }
 
@@ -48,11 +52,7 @@ func (e *Engine) GetSyncRunRecord(ctx context.Context, syncID string) (*v3.SyncR
 	if syncID == "" {
 		return nil, errors.New("GetSyncRunRecord: empty sync_id")
 	}
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return nil, err
-	}
-	val, closer, err := e.db.Get(encodeSyncRunKey(idBytes))
+	val, closer, err := e.db.Get(encodeSyncRunKey())
 	if err != nil {
 		return nil, err
 	}
@@ -61,20 +61,60 @@ func (e *Engine) GetSyncRunRecord(ctx context.Context, syncID string) (*v3.SyncR
 	if err := unmarshalRecord(val, r); err != nil {
 		return nil, fmt.Errorf("GetSyncRunRecord: unmarshal: %w", err)
 	}
+	// The sync-run record lives at a single fixed key (one sync per
+	// file). A lookup for a sync_id other than the stored one must miss
+	// rather than silently return the wrong sync — ResumeSync,
+	// StartOrResumeSync, and CloneSync all rely on a not-found error to
+	// distinguish "this sync exists" from "some sync exists".
+	if r.GetSyncId() != syncID {
+		return nil, pebble.ErrNotFound
+	}
 	return r, nil
 }
 
 func (e *Engine) DeleteSyncRunRecord(ctx context.Context, syncID string) error {
-	return e.withWrite(func() error {
+	// AllowSealed: sync-run pruning is metadata maintenance on finished
+	// syncs, same class as PutSyncRunRecord above.
+	return e.withWriteAllowSealed(func() error {
 		if syncID == "" {
 			return errors.New("DeleteSyncRunRecord: empty sync_id")
 		}
-		idBytes, err := e.resolveSyncBytes(syncID)
-		if err != nil {
-			return err
+		// Single fixed sync-run key: only delete when the stored record
+		// is the requested sync. A mismatch (or absence) is a no-op, so
+		// a stale id can't clobber a different sync's record.
+		val, closer, getErr := e.db.Get(encodeSyncRunKey())
+		if getErr != nil {
+			if errors.Is(getErr, pebble.ErrNotFound) {
+				return nil
+			}
+			return getErr
 		}
-		return e.db.Delete(encodeSyncRunKey(idBytes), writeOpts(e.opts.durability))
+		stored := &v3.SyncRunRecord{}
+		uErr := unmarshalRecord(val, stored)
+		closer.Close()
+		if uErr != nil {
+			return fmt.Errorf("DeleteSyncRunRecord: unmarshal: %w", uErr)
+		}
+		if stored.GetSyncId() != syncID {
+			return nil
+		}
+		return e.db.MetaDelete(encodeSyncRunKey(), writeOpts(e.opts.durability))
 	})
+}
+
+// hasSyncRun reports whether the engine already holds a sync-run
+// record (the file's one sync). StartNewSync uses it to decide whether
+// a prior sync must be wiped before the replacement is bound.
+func (e *Engine) hasSyncRun() (bool, error) {
+	_, closer, err := e.db.Get(encodeSyncRunKey())
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	_ = closer.Close()
+	return true, nil
 }
 
 // IterateAllSyncRuns iterates every sync_run record in the engine.
@@ -108,7 +148,7 @@ func (e *Engine) IterateAllSyncRuns(ctx context.Context, yield func(*v3.SyncRunR
 // This is the single source of truth for "pick the latest finished
 // sync" on the Pebble engine; all three external entry points
 // (connectorstore.LatestFinishedSyncIDFetcher,
-// dotc1z.SyncMeta.LatestFullSync / LatestFinishedSyncOfAnyType, and
+// c1zstore.SyncMeta.LatestFullSync / LatestFinishedSyncOfAnyType, and
 // reader_v2.SyncsReaderService.GetLatestFinishedSync) call here so
 // the tiebreaker and predicate semantics stay consistent.
 //

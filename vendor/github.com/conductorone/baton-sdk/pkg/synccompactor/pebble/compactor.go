@@ -1,26 +1,3 @@
-// Package pebble implements the cross-engine compaction primitive for
-// the v3 Pebble-backed storage engine.
-//
-// The compactor takes a `base` engine and one or more `applied`
-// engines (each representing a sync_run worth of records) and atomically
-// merges `applied`'s data into `base` using pebble.DB.IngestAndExcise:
-//
-//  1. For each applied engine, iterate its records in the source
-//     engine's key order and accumulate them into an SST file on disk.
-//  2. Call base.DB.IngestAndExcise(paths, exciseSpan) with the new
-//     SST and the key range covering the applied sync_id. Pebble
-//     atomically:
-//     (a) excises every key in [exciseSpan.Start, exciseSpan.End)
-//     from base — old sync_id rows go away in one shot.
-//     (b) ingests the SST as a new L6 file (or flushable, depending
-//     on Pebble's choice) under that range.
-//
-// The net effect is a byte-level merge: zero proto encode/decode per
-// record, zero LSM compaction churn from a record-by-record Put loop.
-//
-// Bound: each Compact call replaces exactly one sync_id range in the
-// destination. Multi-sync rollup is a higher-level loop that Compact
-// in sequence.
 package pebble
 
 import (
@@ -33,7 +10,6 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 
 	enginepkg "github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble"
-	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/codec"
 )
 
 // ErrEmptySync is returned when Compact is called with a sync_id that
@@ -42,8 +18,25 @@ import (
 var ErrEmptySync = errors.New("synccompactor/pebble: source has no records under the given sync_id")
 
 // Compactor merges sync_run data between two Pebble engines using
-// IngestAndExcise. Reusable across many Compact calls; safe for
-// sequential use only (not concurrent).
+// pebble.DB.IngestAndExcise:
+//
+//  1. For each bucket of the applied sync, iterate its records in the
+//     source engine's key order and accumulate them into an SST file
+//     on disk.
+//  2. Call base.DB.IngestAndExcise with the new SST and the key range
+//     covering the applied sync_id. Pebble atomically (a) excises
+//     every key in the span from base — old sync_id rows go away in
+//     one shot — and (b) ingests the SST as a new L6 file (or
+//     flushable, depending on Pebble's choice) under that range.
+//
+// The net effect is a byte-level merge: zero proto encode/decode per
+// record, zero LSM compaction churn from a record-by-record Put loop.
+// Each Compact call replaces exactly one sync_id range in the
+// destination; multi-sync rollup is a higher-level loop calling
+// Compact in sequence.
+//
+// Reusable across many Compact calls; safe for sequential use only
+// (not concurrent).
 type Compactor struct {
 	base   *enginepkg.Engine
 	tmpDir string
@@ -74,10 +67,9 @@ func NewCompactor(base *enginepkg.Engine, tmpDir string) (*Compactor, error) {
 // source's view of that sync.
 //
 // Atomicity: per-bucket atomic, NOT whole-Compact atomic. Each
-// IngestAndExcise call (one per record-type bucket: grants,
-// by_entitlement index, by_principal index) is atomic from base's
-// perspective — a concurrent reader sees the old-or-new state of that
-// bucket, never a mixture. However, the multi-bucket loop is NOT
+// IngestAndExcise call (one per record-type bucket: grants, by_principal index,
+// etc.) is atomic from base's perspective — a concurrent reader sees the
+// old-or-new state of that bucket, never a mixture. However, the multi-bucket loop is NOT
 // transactional as a whole: a crash or hard cancellation mid-loop
 // leaves base with new data in some buckets and old data in others
 // (and the same for the DeleteRange-only path used for empty
@@ -85,7 +77,7 @@ func NewCompactor(base *enginepkg.Engine, tmpDir string) (*Compactor, error) {
 // step is idempotent (excise + ingest the same SSTs again converges
 // to the source's view).
 //
-// Caller is responsible for quiescing writes to `source` for the
+// Caller is responsible for not writing to `source` for the
 // duration of the call (an active syncer would invalidate the SST as
 // it's being built).
 func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncID string) error {
@@ -96,26 +88,18 @@ func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncI
 		return errors.New("synccompactor/pebble.Compact: syncID is required")
 	}
 
-	srcDB := source.DB()
-	if srcDB == nil {
-		return errors.New("synccompactor/pebble.Compact: source engine has no DB (closed?)")
-	}
-	dstDB := c.base.DB()
-	if dstDB == nil {
-		return errors.New("synccompactor/pebble.Compact: base engine has no DB (closed?)")
-	}
+	// This function writes the base keyspace through the engine's merge
+	// surface (a closed engine surfaces ErrEngineClosing from the
+	// error-returning ops, and an explicit panic from NewFoldBatch);
+	// invalidate the engine's bare-id lookup state on the way out (even on
+	// error — earlier buckets may already have been replaced).
+	defer c.base.InvalidateBareIDLookups()
 
-	syncIDBytes, err := codec.EncodeSyncID(syncID)
-	if err != nil {
-		return fmt.Errorf("synccompactor/pebble.Compact: encode syncID: %w", err)
-	}
-
-	// The full key range that belongs to this sync across all record
-	// types and indexes. The v3 key layout puts sync_id inside each
-	// type bucket, so a single range does not cover all sync-owned
-	// keys. Instead we walk each bucket and emit one SST per bucket,
-	// excising each bucket's [sync_lo, sync_hi) range.
-	plans := buildBucketPlans(syncIDBytes)
+	// The full key range belonging to the file's one sync, across all
+	// record types and indexes. v3 keys carry no sync_id, so each
+	// record-type/index bucket is one contiguous range. We walk each
+	// bucket and emit one SST per bucket, excising that bucket's range.
+	plans := buildBucketPlans()
 
 	type pendingIngest struct {
 		sstPath    string
@@ -138,7 +122,7 @@ func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncI
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		iter, err := srcDB.NewIter(&pebble.IterOptions{
+		iter, err := source.NewIter(&pebble.IterOptions{
 			LowerBound: plan.lower,
 			UpperBound: plan.upper,
 		})
@@ -146,7 +130,7 @@ func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncI
 			return fmt.Errorf("compact: source iter for %s: %w", plan.name, err)
 		}
 
-		sstPath := filepath.Join(c.tmpDir, fmt.Sprintf("compact-%s-%x.sst", plan.name, syncIDBytes[:4]))
+		sstPath := filepath.Join(c.tmpDir, fmt.Sprintf("compact-%s-%s.sst", plan.name, syncID))
 		b, err := buildSSTFromIter(ctx, sstPath, iter)
 		_ = iter.Close()
 		if err != nil {
@@ -164,7 +148,7 @@ func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncI
 			// with zero SSTs (the ingest must reference at least one
 			// file), so we fall back to a RangeDelete + Flush.
 			_ = os.Remove(sstPath)
-			if err := dstDB.DeleteRange(plan.lower, plan.upper, pebble.Sync); err != nil {
+			if err := c.base.DropKeyRange(plan.lower, plan.upper, pebble.Sync); err != nil {
 				return fmt.Errorf("compact: excise-only DeleteRange for %s: %w", plan.name, err)
 			}
 			continue
@@ -196,13 +180,7 @@ func (c *Compactor) Compact(ctx context.Context, source *enginepkg.Engine, syncI
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := dstDB.IngestAndExcise(
-			ctx,
-			[]string{p.sstPath},
-			nil,
-			nil,
-			p.exciseSpan,
-		); err != nil {
+		if err := c.base.ReplaceRangeWithSSTs(ctx, []string{p.sstPath}, p.exciseSpan); err != nil {
 			return fmt.Errorf("compact: IngestAndExcise: %w", err)
 		}
 	}

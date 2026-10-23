@@ -9,12 +9,9 @@ import (
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
-
-func shouldConvertSQLiteToPebble(engine Engine, readOnly bool, existingSQLite bool) bool {
-	return engine == EnginePebble && !readOnly && existingSQLite
-}
 
 type pebbleOpenOptions struct {
 	tmpDir             string
@@ -26,7 +23,7 @@ type pebbleOpenOptions struct {
 	skipCleanup        bool
 	skipVacuum         bool
 	v2GrantsWriter     bool
-	payloadEncoding    PayloadEncoding
+	payloadEncoding    c1zstore.PayloadEncoding
 }
 
 func pebbleOpenOptionsFromC1Z(options *c1zOptions) pebbleOpenOptions {
@@ -47,34 +44,66 @@ func pebbleOpenOptionsFromC1Z(options *c1zOptions) pebbleOpenOptions {
 // convertSQLiteC1ZToPebble converts src into a new v3/Pebble .c1z at outPath,
 // which must already exist as a v1/SQLite .c1z. The converted file atomically
 // replaces outPath on success.
+//
+// Uses ToPebble's default ConvertResolveBehaviorNewest so an unfinished or
+// non-full convertible sync can still migrate (unlike baton to-pebble, which
+// requests ConvertResolveBehaviorFullFinished).
+//
+// This is lossy by design, and the loss is not recoverable: a Pebble c1z holds
+// exactly one sync, and the converted file replaces outPath, so every sync the
+// source held other than the selected one is gone. A SQLite c1z that holds a
+// finished full sync plus a newer partial (the shape a targeted sync leaves
+// behind) converts to the partial alone — a subset of the snapshot SQLite
+// readers were served, since SQLite's default read view prefers a finished
+// full. The tradeoff is deliberate: the newest run is the work that cannot be
+// reproduced from elsewhere, while an earlier finished sync has already been
+// uploaded.
+//
+// Because the loss is permanent, every dropped sync is logged at WARN with its
+// id, type, start time, and whether it had finished.
 func convertSQLiteC1ZToPebble(ctx context.Context, src *C1File, outPath string) error {
 	ctx, span := tracer.Start(ctx, "convertSQLiteC1ZToPebble")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
 	tmpOut := outPath + ".pebble-convert.tmp"
-	if removeErr := os.Remove(tmpOut); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+	if removeErr := os.Remove(tmpOut); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) { // #nosec G703 -- conversion output path is caller-controlled by API design.
 		err = removeErr
 		return err
 	}
 
-	if _, err = src.ToPebble(ctx, tmpOut, ""); err != nil {
-		_ = os.Remove(tmpOut)
+	var stats *ConvertStats
+	if stats, err = src.ToPebble(ctx, tmpOut, ""); err != nil {
+		_ = os.Remove(tmpOut) // #nosec G703 -- cleanup of caller-selected conversion temp output.
 		return err
 	}
 
 	if err = src.closeWithoutSave(ctx); err != nil {
-		_ = os.Remove(tmpOut)
+		_ = os.Remove(tmpOut) // #nosec G703 -- cleanup of caller-selected conversion temp output.
 		return fmt.Errorf("convert-open: close sqlite source: %w", err)
 	}
 
-	if err = os.Rename(tmpOut, outPath); err != nil {
-		_ = os.Remove(tmpOut)
+	if err = os.Rename(tmpOut, outPath); err != nil { // #nosec G703 -- conversion output path is caller-controlled by API design.
+		_ = os.Remove(tmpOut) // #nosec G703 -- cleanup of caller-selected conversion temp output.
 		return fmt.Errorf("convert-open: replace output c1z: %w", err)
 	}
 
-	ctxzap.Extract(ctx).Info("convert-open: converted sqlite c1z to pebble",
+	l := ctxzap.Extract(ctx)
+	// WARN, not Info: the rename above replaced the v1 artifact, so any sync
+	// the conversion did not select is gone for good. This line is the only
+	// record an operator gets of what the file used to hold.
+	if len(stats.DiscardedSyncs) > 0 {
+		l.Warn("convert-open: discarded syncs not carried into the pebble c1z",
+			append([]zap.Field{
+				zap.String("path", outPath),
+				zap.String("kept_sync_id", stats.SourceSyncID),
+			}, discardedSyncFields(stats.DiscardedSyncs)...)...,
+		)
+	}
+	l.Info("convert-open: converted sqlite c1z to pebble",
 		zap.String("path", outPath),
+		zap.String("kept_sync_id", stats.SourceSyncID),
+		zap.Int("discarded_sync_count", len(stats.DiscardedSyncs)),
 	)
 
 	return nil

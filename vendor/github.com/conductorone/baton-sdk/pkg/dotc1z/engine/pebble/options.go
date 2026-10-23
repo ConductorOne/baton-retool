@@ -2,11 +2,12 @@ package pebble
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+	"go.uber.org/zap"
 )
 
 // SDKPebbleFormat is the on-disk format version this SDK release
@@ -16,34 +17,9 @@ import (
 // newer than what the binary supports.
 const SDKPebbleFormat = pebble.FormatNewest
 
-// Preset selects per-deployment defaults for engine tuning. Set once
-// at engine-open via WithPreset; never changes for the engine's
-// lifetime.
-type Preset int
-
-const (
-	// PresetBackendInfra is the production default: 256 MiB block cache,
-	// per-level compression presets tuned for write-once-read-many sync
-	// payloads, MaxConcurrentCompactions ≤ 4.
-	PresetBackendInfra Preset = iota
-
-	// PresetBackendInfraHot is for hosts that run many engines in the
-	// same process (e.g. C1's per-app ReaderCache). 4 GiB block cache;
-	// otherwise identical to PresetBackendInfra. Use WithSharedCache to
-	// share one cache across engines.
-	PresetBackendInfraHot
-
-	// PresetCLI is for one-shot tooling. 32 MiB cache, low compaction
-	// concurrency. Optimized for fast open/close rather than steady-
-	// state throughput.
-	PresetCLI
-)
-
 // Durability controls how aggressively the engine fsyncs writes. The
-// default for production is DurabilitySync; the fresh-sync fast path
-// (which uses pebble.NoSync for in-flight grant batches) falls under
-// DurabilityNoSync because the sync workflow can replay from the
-// connector if the host crashes before checkpoint.
+// default for production is DurabilitySync. Commits that take
+// recordWriteOpts do not consult it.
 type Durability int
 
 const (
@@ -55,7 +31,6 @@ const (
 // Options configures an Engine. Construct via the WithXxx functional
 // options passed to Open.
 type Options struct {
-	preset      Preset
 	sharedCache *pebble.Cache
 	durability  Durability
 
@@ -66,14 +41,36 @@ type Options struct {
 	// readOnly opens the engine without write permission. Save is
 	// disallowed in this mode.
 	readOnly bool
+
+	// grantDigestIndex controls whether the seal-time deferred pass
+	// (BuildDeferredGrantIndexes) also constructs the
+	// by_entitlement_principal_hash index and the per-entitlement grant
+	// digests — the substrate for cross-file grant diffing. Default on.
+	// The write paths never maintain either inline, so this gates only
+	// the fused derivation at EndSync. See WithGrantDigestIndex.
+	grantDigestIndex bool
+
+	// vfs, when non-nil, overrides the filesystem the engine (and the
+	// pebble.DB under it) performs its IO through. nil leaves
+	// pebble.Options.FS nil, so pebble's EnsureDefaults applies its own
+	// default (disk-health-wrapped vfs.Default) exactly as before this
+	// option existed — production callers are unchanged. See WithVFS.
+	vfs vfs.FS
+
+	// pebbleLogger, when non-nil, replaces discardPebbleLogger as the
+	// pebble.Options.Logger. Test-only (unexported, set by in-package
+	// tests via an inline Option): fault-injection tests need a Fatalf
+	// that does not panic — pebble treats a failed WAL commit as
+	// fatal (db.go commitWrite), and an unrecovered panic would kill the
+	// whole test binary where the intent is to observe the "crash" and
+	// assert on what durably survived it. The sweep installs a gate
+	// that parks the goroutine and signals the harness on injected
+	// engines, and a fail-fast panicking logger on clean ones.
+	pebbleLogger pebble.Logger
 }
 
 // Option is a functional option passed to Open.
 type Option func(*Options)
-
-// WithPreset picks one of PresetBackendInfra (default),
-// PresetBackendInfraHot, or PresetCLI.
-func WithPreset(p Preset) Option { return func(o *Options) { o.preset = p } }
 
 // WithSharedCache reuses a single *pebble.Cache across multiple
 // engine instances. Mandatory for any caller that opens >1 engine in
@@ -86,12 +83,25 @@ func WithPreset(p Preset) Option { return func(o *Options) { o.preset = p } }
 // Unrefs it in Engine.Close.
 func WithSharedCache(c *pebble.Cache) Option { return func(o *Options) { o.sharedCache = c } }
 
-// WithDurability selects the fsync policy for writes. Default is
-// DurabilitySync.
+// WithDurability sets Options.durability. Default is DurabilitySync.
 func WithDurability(d Durability) Option { return func(o *Options) { o.durability = d } }
 
 // WithReadOnly opens the engine in read-only mode. Save is disallowed.
 func WithReadOnly(readOnly bool) Option { return func(o *Options) { o.readOnly = readOnly } }
+
+// WithGrantDigestIndex toggles the seal-time construction of the
+// by_entitlement_principal_hash index and the per-entitlement grant
+// digests. Default true.
+//
+// Set false on files that will never be grant-diffed (e.g. local CLI
+// syncs, connector development) to skip the derivation work in the
+// EndSync deferred pass. Safe to toggle per Open: a file sealed with
+// this off simply stores no digest roots, which readers and the
+// cross-file comparison treat as "missing — recalculate /
+// whole-entitlement dirty", never as "no grants".
+func WithGrantDigestIndex(enabled bool) Option {
+	return func(o *Options) { o.grantDigestIndex = enabled }
+}
 
 // WithSlowQueryThreshold overrides the default 5 s threshold for
 // slow-iterator logging.
@@ -99,10 +109,35 @@ func WithSlowQueryThreshold(d time.Duration) Option {
 	return func(o *Options) { o.slowQueryThreshold = d }
 }
 
+// WithVFS overrides the filesystem the engine performs its IO through.
+// This covers the pebble.DB itself (pebble.Options.FS) and the engine's
+// own SST staging (the deferred index build, digest build, bulk import,
+// synth layer, id-index migration — everything created through
+// newBulkSSTWriter and later handed to Ingest/IngestAndExcise), plus
+// the read-only checkpoint clone. Spill-chunk scratch files are NOT
+// routed through it: they are written and read back exclusively by
+// engine code (never by the pebble.DB), so they stay on the host OS
+// filesystem regardless of the engine FS.
+//
+// Intended for tests: fault injection (vfs/errorfs) and crash
+// simulation (vfs.NewCrashableMem). Production callers never set it;
+// nil (the default) means vfs.Default, matching pebble's own default.
+func WithVFS(fs vfs.FS) Option {
+	return func(o *Options) { o.vfs = fs }
+}
+
+// WithLogger overrides Pebble's process-terminating default logger. It exists
+// for fault-injection harnesses that must observe Fatalf as a simulated process
+// crash; production callers should retain the default logger.
+func WithLogger(logger pebble.Logger) Option {
+	return func(o *Options) { o.pebbleLogger = logger }
+}
+
 // newPebbleOptions builds the *pebble.Options for the Engine. The
 // returned struct is consumed once at pebble.Open; the caller does
-// not retain a reference.
-func newPebbleOptions(o *Options) *pebble.Options {
+// not retain a reference. onCorruption receives every on-disk
+// corruption pebble reports, from reads and background compactions.
+func newPebbleOptions(o *Options, onCorruption func(pebble.DataCorruptionInfo)) *pebble.Options {
 	opts := &pebble.Options{
 		FormatMajorVersion:          SDKPebbleFormat,
 		MemTableSize:                64 << 20,
@@ -136,23 +171,40 @@ func newPebbleOptions(o *Options) *pebble.Options {
 		Comparer:   pebble.DefaultComparer,
 		ReadOnly:   o.readOnly,
 		Logger:     discardPebbleLogger{},
+		// nil FS gets pebble's own EnsureDefaults treatment
+		// (disk-health-wrapped vfs.Default), so the no-override case is
+		// byte-identical to before WithVFS existed.
+		FS: o.vfs,
 	}
+	if o.pebbleLogger != nil {
+		opts.Logger = o.pebbleLogger
+	}
+	// Without a DataCorruption listener pebble calls Logger.Fatalf on the
+	// first corrupt block it reads; with one, the read returns the
+	// corruption error, so a corrupt .c1z fails its open or read instead.
+	opts.EventListener = &pebble.EventListener{
+		DataCorruption: func(info pebble.DataCorruptionInfo) {
+			zap.L().Error("pebble: on-disk corruption",
+				zap.String("path", info.Path),
+				zap.String("bounds", info.Bounds.String()),
+				zap.Error(info.Details),
+			)
+			onCorruption(info)
+		},
+	}
+	// Pausable variant of pebble's default ConcurrencyLimitScheduler so the
+	// engine can suppress automatic compactions during the EndSync-to-close
+	// window, where their output never survives to the saved artifact (see
+	// pausableCompactionScheduler).
+	opts.Experimental.CompactionScheduler = newPausableCompactionScheduler()
 	// L0 BlockSize tuning lands per-level below; bloom-filter wiring can
 	// be added after benchmark data justifies it.
 	opts.Levels[0].BlockSize = 32 << 10
 
-	// Cache: shared or minted per preset.
-	if o.sharedCache != nil {
-		opts.Cache = o.sharedCache
+	if o.sharedCache == nil {
+		opts.Cache = pebble.NewCache(256 << 20)
 	} else {
-		switch o.preset {
-		case PresetBackendInfraHot:
-			opts.Cache = pebble.NewCache(4 << 30)
-		case PresetCLI:
-			opts.Cache = pebble.NewCache(32 << 20)
-		default:
-			opts.Cache = pebble.NewCache(256 << 20)
-		}
+		opts.Cache = o.sharedCache
 	}
 
 	return opts
@@ -167,30 +219,46 @@ func writeOpts(d Durability) *pebble.WriteOptions {
 	return pebble.Sync
 }
 
+// recordWriteOpts is NoSync for every commit that takes it, whether the
+// sync is fresh or bound and regardless of Options.durability.
+// TestBoundSyncRecordWritesDoNotSyncTheWAL pins the Put path.
+//
+// The artifact does not depend on the WAL. CheckpointTo flushes
+// memtables, cuts the checkpoint, and truncateCheckpointWALs zeroes
+// every copied .log, so what ships is the SST bytes the flush produced.
+// Nothing reads the WAL after a crash either: OpenStore unpacks into a
+// temp directory that a dying process orphans and the next process never
+// finds. An fsync here hardens bytes nothing will read.
+//
+// Writes a crash image must hold do not come through here:
+// PutSyncRunRecord says why at its site, and the ledger's in-flight stamp
+// rides the first ledger batch, which BeginCollecting, takeover and
+// BeginPass commit with pebble.Sync before any page. FinishSync flushes
+// and fences the WAL once at EndSync.
+var recordWriteOpts = pebble.NoSync
+
 func defaultOptions() *Options {
 	return &Options{
-		preset:             PresetBackendInfra,
 		durability:         DurabilitySync,
 		slowQueryThreshold: 5 * time.Second,
+		grantDigestIndex:   true,
 	}
 }
 
-// discardPebbleLogger silences Pebble's WAL discovery / compaction
-// chatter on Infof, surfaces Errorf to stderr (compaction errors and
-// WAL recovery warnings are operationally significant — silencing them
-// would hide real problems), and terminates on Fatalf via os.Exit(1)
-// to match Pebble's default-logger semantics. We deliberately do NOT
-// panic on Fatalf: a recover() in a gRPC interceptor or HTTP framework
-// could otherwise swallow it and let the program continue on a
-// potentially-corrupted storage engine.
+// discardPebbleLogger drops Pebble's WAL discovery / compaction chatter
+// on Infof and sends Errorf and Fatalf to the global zap logger, since
+// pebble.Logger carries no ctx. Fatalf then panics instead of calling
+// os.Exit, so the failure carries a stack trace. A caller that recovers
+// the panic must stop using the engine.
 type discardPebbleLogger struct{}
 
 func (discardPebbleLogger) Infof(format string, args ...interface{}) {}
 func (discardPebbleLogger) Errorf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "pebble: "+format+"\n", args...)
+	zap.L().Error("pebble: " + fmt.Sprintf(format, args...))
 }
 
 func (discardPebbleLogger) Fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "pebble FATAL: "+format+"\n", args...)
-	os.Exit(1)
+	msg := "pebble FATAL: " + fmt.Sprintf(format, args...)
+	zap.L().Error(msg)
+	panic(msg)
 }

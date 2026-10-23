@@ -90,6 +90,7 @@ func NewDPoPClient(ctx context.Context, clientID string, clientSecret string) (g
 	opts := []dpop_oauth.TokenSourceOption{
 		dpop_oauth.WithRequestOption(dpop_oauth.WithCustomMarshaler(idAttMarshaller.Marshal)),
 		dpop_oauth.WithHTTPClient(lambdaHTTPClient(tlsConfig)),
+		dpop_oauth.WithNonceStore(dpop_oauth.NewNonceStore()), // satisfy use_dpop_nonce
 	}
 	tokenSource, err := dpop_oauth.NewTokenSource(proofer, tokenURL, clientID, clientSecretJWK, opts...)
 	if err != nil {
@@ -128,8 +129,7 @@ func lambdaTLSConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("new-dpop-client: failed to load system cert pool: %w", err)
 	}
 	if certPath := strings.TrimSpace(os.Getenv(lambdaCACertPathEnv)); certPath != "" {
-		//nolint:gosec // Operator-provided CA bundle path for lambda-hosted connector configuration.
-		pemBytes, err := os.ReadFile(certPath)
+		pemBytes, err := os.ReadFile(certPath) // #nosec G703 -- operator-provided CA bundle path for lambda-hosted connector configuration.
 		if err != nil {
 			return nil, fmt.Errorf("new-dpop-client: failed to read %s: %w", lambdaCACertPathEnv, err)
 		}

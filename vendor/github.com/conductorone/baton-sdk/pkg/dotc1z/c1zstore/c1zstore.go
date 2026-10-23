@@ -7,15 +7,15 @@
 // pkg/connectorstore. Storage engines (pkg/dotc1z's SQLite C1File,
 // pkg/dotc1z/engine/pebble's Adapter) implement these interfaces without
 // importing pkg/dotc1z, which lets dotc1z import the engines and register
-// them statically. pkg/dotc1z re-exports every type here under its
-// historical name (dotc1z.C1ZStore = c1zstore.Store, etc.), so callers
-// outside the engine packages can keep using the dotc1z names.
+// them statically. Callers reference these types directly through this
+// package (c1zstore.Store, c1zstore.Engine, etc.).
 package c1zstore
 
 import (
 	"context"
 
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
+	"github.com/conductorone/baton-sdk/pkg/types/sessions"
 )
 
 // Store is the internal contract used by the sync pipeline, compactor, and
@@ -28,7 +28,7 @@ import (
 //
 //   - Grant operations with expansion-aware semantics, accessed via Grants().
 //   - Sync-run metadata operations, accessed via SyncMeta().
-//   - File-level operations (clone, diff), accessed via FileOps().
+//   - File-level operations (clone), accessed via FileOps().
 //
 // Implementations:
 //
@@ -58,4 +58,20 @@ type Store interface {
 	// Close releases resources, flushing any pending writes.
 	// Overrides the embedded Reader.Close to document this signature.
 	Close(ctx context.Context) error
+
+	SessionStore() sessions.SessionStore
+}
+
+// GrantGenerationDigest binds derived metadata to the exact grant generation
+// stored in an artifact.
+type GrantGenerationDigest struct {
+	Hash       []byte
+	Count      int64
+	ABIVersion uint32
+}
+
+// GrantGenerationDigestReader is implemented by stores that persist an exact
+// whole-file grant digest at seal time.
+type GrantGenerationDigestReader interface {
+	GrantGenerationDigest(ctx context.Context) (GrantGenerationDigest, bool, error)
 }

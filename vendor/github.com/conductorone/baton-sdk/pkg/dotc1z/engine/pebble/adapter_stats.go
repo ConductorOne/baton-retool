@@ -3,8 +3,14 @@ package pebble
 import (
 	"context"
 
+	"github.com/cockroachdb/pebble/v2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 )
 
 // Stats returns a map of {table_name: row_count} for the given sync.
@@ -14,83 +20,115 @@ import (
 // per-record-type bucket and count keys in the [sync_lo, sync_hi)
 // range. Counts are exact (not estimates).
 //
-// Mirrors connectorstore semantics: syncType == SyncTypeAny accepts
-// any sync; otherwise we filter by the sync_run's type.
-func (a *Adapter) Stats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
-	if syncID == "" {
-		syncID = a.currentSyncID()
+// Mirrors connectorstore / SQLite semantics: syncType == SyncTypeAny
+// accepts any sync; otherwise we filter by the sync_run's type. An
+// empty syncID resolves to the latest finished sync of that type
+// (NotFound if none).
+func (e *Engine) Stats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
+	stats, err := e.stats(ctx, syncType, syncID)
+	if err != nil {
+		return nil, err
 	}
-	if syncID == "" {
-		// No current sync — return empty stats (matches SQLite's
-		// behavior when no sync exists yet).
+	if stats == nil {
 		return map[string]int64{}, nil
 	}
+	return statsRecordToMap(stats), nil
+}
 
-	// Verify the sync exists and matches the requested type.
-	sr, err := a.engine.GetSyncRunRecord(ctx, syncID)
-	if err == nil && sr != nil {
-		if syncType != connectorstore.SyncTypeAny &&
-			syncType != connectorstore.SyncType(v3SyncTypeToString(sr.GetType())) {
-			return nil, nil
+// StatsV2 returns structured stats for the given sync.
+func (e *Engine) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncID string) (*reader_v2.SyncStats, error) {
+	stats, err := e.stats(ctx, syncType, syncID)
+	if err != nil {
+		return nil, err
+	}
+	return SyncStatsFromRecord(stats), nil
+}
+
+func (e *Engine) stats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (*v3.SyncStatsRecord, error) {
+	if syncID == "" {
+		// Match SQLite C1File.stats: empty syncID resolves to the
+		// latest finished sync of the requested type, never the
+		// in-progress current sync.
+		var err error
+		syncID, err = e.LatestFinishedSyncID(ctx, syncType)
+		if err != nil {
+			return nil, err
+		}
+		if syncID == "" {
+			return nil, errNoFinishedSync(syncType)
 		}
 	}
 
-	// Fast path: read the sidecar populated at EndFreshSync. Sidecar
-	// is one LSM Get vs the legacy fallback's O(N) iteration. Sync
-	// types that haven't run through the sidecar writer (Partial /
-	// Incremental that bypass EndFreshSync) fall through to the
-	// legacy path below.
-	if stats, err := a.engine.readSyncStats(ctx, syncID); err == nil && stats != nil {
-		return statsRecordToMap(stats), nil
+	// Match SQLite C1File.stats: missing sync → NotFound; type
+	// mismatch → InvalidArgument.
+	sr, err := e.GetSyncRunRecord(ctx, syncID)
+	if err != nil {
+		return nil, c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
+	}
+	if sr == nil {
+		return nil, status.Errorf(codes.NotFound, "sync '%s' not found", syncID)
+	}
+	if syncType != connectorstore.SyncTypeAny &&
+		syncType != connectorstore.SyncType(v3SyncTypeToString(sr.GetType())) {
+		return nil, status.Errorf(codes.InvalidArgument, "sync '%s' is not of type '%s'", syncID, syncType)
 	}
 
-	return a.statsFromIteration(ctx, syncID)
+	if cached, err := e.readSyncStats(ctx, syncID); err == nil && cached != nil {
+		return cached, nil
+	}
+	return e.statsFromIteration(ctx, syncID)
 }
 
-// statsFromIteration is the legacy O(N) path retained as the
-// sidecar fallback. Used by older c1z files that predate the
-// sidecar and by sync types that don't go through EndFreshSync.
-func (a *Adapter) statsFromIteration(ctx context.Context, syncID string) (map[string]int64, error) {
-	counts := map[string]int64{
-		"resource_types": 0,
-		"resources":      0,
-		"entitlements":   0,
-		"grants":         0,
-		"assets":         0,
+// statsFromIteration is O(records). Stats reaches it when the sidecar
+// is missing: files that predate it, or a PersistSyncStats failure,
+// which endSyncFinalize logs and swallows.
+func (e *Engine) statsFromIteration(ctx context.Context, syncID string) (*v3.SyncStatsRecord, error) {
+	stats := &v3.SyncStatsRecord{
+		SyncId:                          syncID,
+		ResourceTypes:                   0,
+		Resources:                       0,
+		Entitlements:                    0,
+		Grants:                          0,
+		Assets:                          0,
+		ResourcesByResourceType:         make(map[string]int64),
+		GrantsByEntitlementResourceType: make(map[string]int64),
+		EntitlementsByResourceType:      make(map[string]int64),
 	}
 
-	if err := a.engine.IterateResourceTypesBySync(ctx, syncID, func(*v3.ResourceTypeRecord) bool {
-		counts["resource_types"]++
+	if err := e.IterateResourceTypes(ctx, func(r *v3.ResourceTypeRecord) bool {
+		stats.ResourceTypes++
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	if err := a.engine.IterateResourcesBySync(ctx, syncID, func(r *v3.ResourceRecord) bool {
-		counts["resources"]++
-		counts[r.GetResourceTypeId()]++
+	if err := e.IterateResources(ctx, func(r *v3.ResourceRecord) bool {
+		stats.Resources++
+		stats.ResourcesByResourceType[r.GetResourceTypeId()]++
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	if err := a.engine.IterateEntitlementsBySync(ctx, syncID, func(*v3.EntitlementRecord) bool {
-		counts["entitlements"]++
+	if err := e.IterateEntitlements(ctx, func(e *v3.EntitlementRecord) bool {
+		stats.Entitlements++
+		stats.EntitlementsByResourceType[e.GetResource().GetResourceTypeId()]++
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	if err := a.engine.IterateGrantsBySync(ctx, syncID, func(*v3.GrantRecord) bool {
-		counts["grants"]++
+	if err := e.IterateGrants(ctx, func(g *v3.GrantRecord) bool {
+		stats.Grants++
+		stats.GrantsByEntitlementResourceType[g.GetEntitlement().GetResourceTypeId()]++
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	if err := a.engine.IterateAssetsBySync(ctx, syncID, func(*v3.AssetRecord) bool {
-		counts["assets"]++
+	if err := e.IterateAssets(ctx, func(*v3.AssetRecord) bool {
+		stats.Assets++
 		return true
 	}); err != nil {
 		return nil, err
 	}
-	return counts, nil
+	return stats, nil
 }
 
 // statsRecordToMap renders a sidecar SyncStatsRecord into the
@@ -109,7 +147,18 @@ func statsRecordToMap(s *v3.SyncStatsRecord) map[string]int64 {
 	for rt, n := range s.GetResourcesByResourceType() {
 		out[rt] = n
 	}
+
 	return out
+}
+
+// errNoFinishedSync is returned when Stats/StatsV2/GrantStats are
+// called with an empty syncID and no finished sync of the requested
+// type exists. Matches the SQLite C1File.stats contract.
+func errNoFinishedSync(syncType connectorstore.SyncType) error {
+	if syncType == connectorstore.SyncTypeAny || syncType == "" {
+		return status.Error(codes.NotFound, "no finished sync found")
+	}
+	return status.Errorf(codes.NotFound, "no finished sync of type '%s' found", syncType)
 }
 
 // GrantStats returns just the grant count, partitioned by entitlement
@@ -121,14 +170,22 @@ func statsRecordToMap(s *v3.SyncStatsRecord) map[string]int64 {
 // we require the sync_run.Type to match exactly. A type mismatch
 // returns (nil, nil) — the syncer treats that as "nothing to show
 // for this view," same as the SQLite contract.
-func (a *Adapter) GrantStats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
+//
+// Empty syncID resolves to the latest finished sync of syncType
+// (matching Stats / SQLite grantStats), and returns NotFound when
+// none exists.
+func (e *Engine) GrantStats(ctx context.Context, syncType connectorstore.SyncType, syncID string) (map[string]int64, error) {
 	if syncID == "" {
-		syncID = a.currentSyncID()
+		var err error
+		syncID, err = e.LatestFinishedSyncID(ctx, syncType)
+		if err != nil {
+			return nil, err
+		}
+		if syncID == "" {
+			return nil, errNoFinishedSync(syncType)
+		}
 	}
-	if syncID == "" {
-		return map[string]int64{}, nil
-	}
-	sr, err := a.engine.GetSyncRunRecord(ctx, syncID)
+	sr, err := e.GetSyncRunRecord(ctx, syncID)
 	if err == nil && sr != nil {
 		if syncType != connectorstore.SyncTypeAny &&
 			syncType != connectorstore.SyncType(v3SyncTypeToString(sr.GetType())) {
@@ -136,7 +193,7 @@ func (a *Adapter) GrantStats(ctx context.Context, syncType connectorstore.SyncTy
 		}
 	}
 	// Fast path: sidecar.
-	if stats, err := a.engine.readSyncStats(ctx, syncID); err == nil && stats != nil {
+	if stats, err := e.readSyncStats(ctx, syncID); err == nil && stats != nil {
 		out := make(map[string]int64, len(stats.GetGrantsByEntitlementResourceType()))
 		for rt, n := range stats.GetGrantsByEntitlementResourceType() {
 			out[rt] = n
@@ -145,7 +202,7 @@ func (a *Adapter) GrantStats(ctx context.Context, syncType connectorstore.SyncTy
 	}
 	// Fallback: iterate.
 	counts := map[string]int64{}
-	if err := a.engine.IterateGrantsBySync(ctx, syncID, func(rec *v3.GrantRecord) bool {
+	if err := e.IterateGrants(ctx, func(rec *v3.GrantRecord) bool {
 		// Match SQLite's `resource_type_id` column semantic on
 		// the grants table — that's the *entitlement's*
 		// resource type, not the principal's.
@@ -162,6 +219,6 @@ func (a *Adapter) GrantStats(ctx context.Context, syncType connectorstore.SyncTy
 // SQLite equivalent returns the .c1z file path; for Pebble we don't
 // have a single file, so this returns the engine's directory. Used
 // by tooling that wants to copy or inspect the storage.
-func (a *Adapter) OutputFilepath() (string, error) {
-	return a.engine.DBDir(), nil
+func (e *Engine) OutputFilepath() (string, error) {
+	return e.DBDir(), nil
 }

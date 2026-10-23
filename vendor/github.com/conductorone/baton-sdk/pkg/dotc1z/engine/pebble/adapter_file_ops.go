@@ -7,13 +7,10 @@ import (
 )
 
 // FileOps returns the FileOps sub-store backed by the Pebble
-// adapter. Implements c1zstore.Store.FileOps(). Both methods are
-// fully implemented: CloneSync materializes one sync's data into a
-// fresh c1z (used by `baton clone`), and GenerateSyncDiff computes
-// the additions-only set difference between two ended syncs and
-// emits a new SyncTypePartial sync (used by the local differ CLI).
-func (a *Adapter) FileOps() c1zstore.FileOps {
-	return pebbleFileOps{a: a, encoding: c1zstore.PayloadEncodingTarZstd}
+// adapter. Implements c1zstore.Store.FileOps(). CloneSync materializes
+// the single sync's data into a fresh c1z (used by `baton clone`).
+func (e *Engine) FileOps() c1zstore.FileOps {
+	return pebbleFileOps{e: e, encoding: c1zstore.PayloadEncodingTarZstd}
 }
 
 // FileOpsWithEncoding returns a FileOps that emits new c1z files
@@ -21,12 +18,12 @@ func (a *Adapter) FileOps() c1zstore.FileOps {
 // pkg/dotc1z to propagate its configured encoding (e.g.
 // PayloadEncodingTar for callers that want uncompressed envelopes)
 // through to CloneSync's output file.
-func (a *Adapter) FileOpsWithEncoding(encoding c1zstore.PayloadEncoding) c1zstore.FileOps {
-	return pebbleFileOps{a: a, encoding: encoding}
+func (e *Engine) FileOpsWithEncoding(encoding c1zstore.PayloadEncoding) c1zstore.FileOps {
+	return pebbleFileOps{e: e, encoding: encoding}
 }
 
 type pebbleFileOps struct {
-	a        *Adapter
+	e        *Engine
 	encoding c1zstore.PayloadEncoding
 }
 
@@ -35,14 +32,14 @@ type pebbleFileOps struct {
 // range-copy every sync-scoped keyspace into a fresh engine,
 // checkpoint, and emit a v3 envelope.
 func (f pebbleFileOps) CloneSync(ctx context.Context, outPath string, syncID string, opts ...c1zstore.CloneSyncOption) error {
-	return cloneSync(ctx, f.a, f.encoding, outPath, syncID, opts...)
+	return cloneSync(ctx, f.e, f.encoding, outPath, syncID, opts...)
 }
 
-// GenerateSyncDiff computes the additions-only set difference
-// between two ended syncs and emits a new SyncTypePartial sync
-// containing them. Matches the SQLite contract in
-// pkg/dotc1z/diff.go (no modifications or deletions captured).
-// Returns the diff sync's ID.
-func (f pebbleFileOps) GenerateSyncDiff(ctx context.Context, baseSyncID, appliedSyncID string) (string, error) {
-	return generateSyncDiff(ctx, f.a, baseSyncID, appliedSyncID)
+// CopyIsolateSync falls back to cloneSync for the Pebble engine. The
+// copy-isolation optimization is SQLite-specific (it copies the SQLite working
+// file and deletes other syncs); the Pebble engine already materializes only
+// the target sync's keyspace into a fresh engine, so it has no whale-rebuild
+// cost to avoid.
+func (f pebbleFileOps) CopyIsolateSync(ctx context.Context, outPath string, syncID string, opts ...c1zstore.CloneSyncOption) error {
+	return cloneSync(ctx, f.e, f.encoding, outPath, syncID, opts...)
 }

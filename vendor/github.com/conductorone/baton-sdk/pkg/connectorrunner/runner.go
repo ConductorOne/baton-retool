@@ -13,6 +13,7 @@ import (
 
 	"github.com/conductorone/baton-sdk/pkg/bid"
 	"github.com/conductorone/baton-sdk/pkg/connectorbuilder"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/field"
 	"github.com/conductorone/baton-sdk/pkg/healthcheck"
 	"github.com/conductorone/baton-sdk/pkg/synccompactor"
@@ -358,9 +359,11 @@ type createAccountConfig struct {
 }
 
 type invokeActionConfig struct {
-	action         string
-	resourceTypeID string // Optional: if set, invokes a resource-scoped action
-	args           *structpb.Struct
+	action            string
+	resourceTypeID    string // Optional: if set, invokes a resource-scoped action
+	args              *structpb.Struct
+	encryptionConfigs []*v2.EncryptionConfig
+	printCredentials  bool
 }
 
 type listActionSchemasConfig struct {
@@ -381,11 +384,6 @@ type eventStreamConfig struct {
 	feedId  string
 	startAt time.Time
 	cursor  string
-}
-
-type syncDifferConfig struct {
-	baseSyncID    string
-	appliedSyncID string
 }
 
 type syncCompactorConfig struct {
@@ -418,13 +416,16 @@ type runnerConfig struct {
 	bulkCreateTicketConfig                *bulkCreateTicketConfig
 	listTicketSchemasConfig               *listTicketSchemasConfig
 	getTicketConfig                       *getTicketConfig
-	syncDifferConfig                      *syncDifferConfig
 	syncCompactorConfig                   *syncCompactorConfig
 	skipFullSync                          bool
+	storageEngine                         c1zstore.Engine
 	workerCount                           int
 	targetedSyncResourceIDs               []string
 	externalResourceC1Z                   string
 	externalResourceEntitlementIdFilter   string
+	externalResourceTraits                []v2.ResourceType_Trait
+	keepPreviousSyncC1ZCapable            bool
+	keepPreviousSyncC1ZEnabled            bool
 	skipEntitlementsAndGrants             bool
 	skipGrants                            bool
 	sessionStoreEnabled                   bool
@@ -568,13 +569,49 @@ func WithOnDemandCreateAccount(c1zPath string, login string, email string, profi
 // WithOnDemandInvokeAction creates an option for invoking an action.
 // If resourceTypeID is provided, it invokes a resource-scoped action.
 func WithOnDemandInvokeAction(c1zPath string, action string, resourceTypeID string, args *structpb.Struct) Option {
+	return withOnDemandInvokeAction(c1zPath, action, resourceTypeID, args, nil, false)
+}
+
+// WithOnDemandInvokeActionWithCredentialPrinting logs decrypted action credentials when printCredentials is true.
+func WithOnDemandInvokeActionWithCredentialPrinting(
+	c1zPath string,
+	action string,
+	resourceTypeID string,
+	args *structpb.Struct,
+	printCredentials bool,
+) Option {
+	return withOnDemandInvokeAction(c1zPath, action, resourceTypeID, args, nil, printCredentials)
+}
+
+// WithOnDemandInvokeActionWithEncryption creates an option for invoking an
+// action with recipients for encrypted results.
+func WithOnDemandInvokeActionWithEncryption(
+	c1zPath string,
+	action string,
+	resourceTypeID string,
+	args *structpb.Struct,
+	encryptionConfigs []*v2.EncryptionConfig,
+) Option {
+	return withOnDemandInvokeAction(c1zPath, action, resourceTypeID, args, encryptionConfigs, false)
+}
+
+func withOnDemandInvokeAction(
+	c1zPath string,
+	action string,
+	resourceTypeID string,
+	args *structpb.Struct,
+	encryptionConfigs []*v2.EncryptionConfig,
+	printCredentials bool,
+) Option {
 	return func(ctx context.Context, cfg *runnerConfig) error {
 		cfg.onDemand = true
 		cfg.c1zPath = c1zPath
 		cfg.invokeActionConfig = &invokeActionConfig{
-			action:         action,
-			resourceTypeID: resourceTypeID,
-			args:           args,
+			action:            action,
+			resourceTypeID:    resourceTypeID,
+			args:              args,
+			encryptionConfigs: encryptionConfigs,
+			printCredentials:  printCredentials,
 		}
 		return nil
 	}
@@ -661,6 +698,13 @@ func WithFullSyncDisabled() Option {
 func WithWorkerCount(workerCount int) Option {
 	return func(ctx context.Context, cfg *runnerConfig) error {
 		cfg.workerCount = workerCount
+		return nil
+	}
+}
+
+func WithStorageEngine(engine c1zstore.Engine) Option {
+	return func(ctx context.Context, cfg *runnerConfig) error {
+		cfg.storageEngine = engine
 		return nil
 	}
 }
@@ -756,14 +800,53 @@ func WithExternalResourceEntitlementFilter(entitlementId string) Option {
 	}
 }
 
-func WithDiffSyncs(c1zPath string, baseSyncID string, newSyncID string) Option {
+// WithExternalResourceTraits sets the resource type traits the External
+// Identity Matcher should sync and match against from the external
+// resource c1z (see WithExternalResourceC1Z). When not called, the matcher
+// falls back to TRAIT_USER/TRAIT_GROUP — the pre-CE-975 default — so
+// existing runner callers keep working unchanged. Passing any traits
+// replaces the default entirely: a connector matching grants against
+// service-principal identities synced by another connector as TRAIT_APP
+// that still wants default user/group matching must pass TRAIT_USER,
+// TRAIT_GROUP, TRAIT_APP.
+func WithExternalResourceTraits(traits ...v2.ResourceType_Trait) Option {
 	return func(ctx context.Context, cfg *runnerConfig) error {
-		cfg.onDemand = true
-		cfg.c1zPath = c1zPath
-		cfg.syncDifferConfig = &syncDifferConfig{
-			baseSyncID:    baseSyncID,
-			appliedSyncID: newSyncID,
-		}
+		cfg.externalResourceTraits = append(cfg.externalResourceTraits, traits...)
+		return nil
+	}
+}
+
+// WithKeepPreviousSyncC1Z is the connector AUTHOR's build-time
+// declaration that this connector supports ETag replay in service
+// mode: after each successful upload the runner retains the uploaded
+// c1z as a local spare (one file, fixed name, replaced atomically each
+// sync) and feeds it to the next full sync as the previous-sync replay
+// source.
+//
+// The capability alone does nothing — the CUSTOMER must also enable it
+// at runtime (--keep-previous-sync-c1z / BATON_KEEP_PREVIOUS_SYNC_C1Z,
+// which sets WithKeepPreviousSyncC1ZRuntimeOptIn). Both are required:
+// the author knows whether the connector emits ETags; the customer
+// decides whether to spend a c1z of host disk on the spare. No effect
+// in local/on-demand modes, which keep their c1z at a stable path
+// already.
+func WithKeepPreviousSyncC1Z() Option {
+	return func(ctx context.Context, cfg *runnerConfig) error {
+		cfg.keepPreviousSyncC1ZCapable = true
+		return nil
+	}
+}
+
+// WithKeepPreviousSyncC1ZRuntimeOptIn is the customer's runtime half of
+// the ETag-replay opt-in, set by the --keep-previous-sync-c1z flag /
+// BATON_KEEP_PREVIOUS_SYNC_C1Z env var. It only takes effect on
+// connectors whose author declared the capability via
+// WithKeepPreviousSyncC1Z; on any other connector it is inert (and the
+// runner logs a warning so the customer isn't left wondering why ETag
+// replay never activates).
+func WithKeepPreviousSyncC1ZRuntimeOptIn() Option {
+	return func(ctx context.Context, cfg *runnerConfig) error {
+		cfg.keepPreviousSyncC1ZEnabled = true
 		return nil
 	}
 }
@@ -995,7 +1078,24 @@ func NewConnectorRunner(ctx context.Context, c types.ConnectorServer, opts ...Op
 			tm = local.NewCreateAccountManager(ctx, cfg.c1zPath, cfg.createAccountConfig.login, cfg.createAccountConfig.email, cfg.createAccountConfig.profile, cfg.createAccountConfig.resourceTypeID)
 
 		case cfg.invokeActionConfig != nil:
-			tm = local.NewActionInvoker(ctx, cfg.c1zPath, cfg.invokeActionConfig.action, cfg.invokeActionConfig.resourceTypeID, cfg.invokeActionConfig.args)
+			if cfg.invokeActionConfig.printCredentials {
+				tm = local.NewActionInvokerWithCredentialPrinting(
+					ctx,
+					cfg.c1zPath,
+					cfg.invokeActionConfig.action,
+					cfg.invokeActionConfig.resourceTypeID,
+					cfg.invokeActionConfig.args,
+				)
+			} else {
+				tm = local.NewActionInvokerWithEncryption(
+					ctx,
+					cfg.c1zPath,
+					cfg.invokeActionConfig.action,
+					cfg.invokeActionConfig.resourceTypeID,
+					cfg.invokeActionConfig.args,
+					cfg.invokeActionConfig.encryptionConfigs,
+				)
+			}
 
 		case cfg.listActionSchemasConfig != nil:
 			tm = local.NewListActionSchemas(ctx, cfg.listActionSchemasConfig.resourceTypeID)
@@ -1016,8 +1116,6 @@ func NewConnectorRunner(ctx context.Context, c types.ConnectorServer, opts ...Op
 			tm = local.NewGetTicket(ctx, cfg.getTicketConfig.ticketID)
 		case cfg.bulkCreateTicketConfig != nil:
 			tm = local.NewBulkTicket(ctx, cfg.bulkCreateTicketConfig.templatePath)
-		case cfg.syncDifferConfig != nil:
-			tm = local.NewDiffer(ctx, cfg.c1zPath, cfg.syncDifferConfig.baseSyncID, cfg.syncDifferConfig.appliedSyncID)
 		case cfg.syncCompactorConfig != nil:
 			c := cfg.syncCompactorConfig
 			if len(c.filePaths) != len(c.syncIDs) {
@@ -1030,17 +1128,19 @@ func NewConnectorRunner(ctx context.Context, c types.ConnectorServer, opts ...Op
 					SyncID:   c.syncIDs[i],
 				})
 			}
-			tm = local.NewLocalCompactor(ctx, cfg.syncCompactorConfig.outputPath, configs, cfg.tempDir)
+			tm = local.NewLocalCompactor(ctx, cfg.syncCompactorConfig.outputPath, configs, cfg.tempDir, local.WithCompactorStorageEngine(cfg.storageEngine))
 		default:
 			tm, err = local.NewSyncer(ctx, cfg.c1zPath,
 				local.WithTmpDir(cfg.tempDir),
 				local.WithExternalResourceC1Z(cfg.externalResourceC1Z),
 				local.WithExternalResourceEntitlementIdFilter(cfg.externalResourceEntitlementIdFilter),
+				local.WithExternalResourceTraits(cfg.externalResourceTraits),
 				local.WithTargetedSyncResources(resources),
 				local.WithSkipEntitlementsAndGrants(cfg.skipEntitlementsAndGrants),
 				local.WithSkipGrants(cfg.skipGrants),
 				local.WithSyncResourceTypeIDs(cfg.syncResourceTypeIDs),
 				local.WithWorkerCount(cfg.workerCount),
+				local.WithStorageEngine(cfg.storageEngine),
 			)
 			if err != nil {
 				return nil, err
@@ -1058,6 +1158,17 @@ func NewConnectorRunner(ctx context.Context, c types.ConnectorServer, opts ...Op
 	// (cfg.onDemand) returned above, and Lambda mode never reaches
 	// NewConnectorRunner. Only this path sends a startup Hello to Conductor
 	// One — local / one-shot managers and Lambda intentionally do not.
+
+	// ETag replay requires BOTH halves of the opt-in: the author's
+	// build-time capability declaration AND the customer's runtime flag.
+	// A runtime flag on a connector without the capability is inert —
+	// warn so the customer isn't left wondering why replay never
+	// activates.
+	keepPreviousSyncC1Z := cfg.keepPreviousSyncC1ZCapable && cfg.keepPreviousSyncC1ZEnabled
+	if cfg.keepPreviousSyncC1ZEnabled && !cfg.keepPreviousSyncC1ZCapable {
+		ctxzap.Extract(ctx).Warn("keep-previous-sync-c1z is set, but this connector does not declare ETag-replay support; the flag has no effect")
+	}
+
 	tm, err := c1api.NewC1TaskManager(
 		ctx,
 		cfg.clientID,
@@ -1066,10 +1177,13 @@ func NewConnectorRunner(ctx context.Context, c types.ConnectorServer, opts ...Op
 		cfg.skipFullSync,
 		cfg.externalResourceC1Z,
 		cfg.externalResourceEntitlementIdFilter,
+		cfg.externalResourceTraits,
 		resources,
 		cfg.syncResourceTypeIDs,
 		cfg.workerCount,
+		cfg.storageEngine,
 		runner.taskConcurrency,
+		keepPreviousSyncC1Z,
 	)
 	if err != nil {
 		return nil, err

@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"sort"
+
+	"github.com/cockroachdb/pebble/v2"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
+	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 )
 
 // ListGrantsForEntitlements is the batched counterpart to
@@ -23,24 +27,48 @@ import (
 //	varint(entitlement_index) || varint(intra_cursor_len) ||
 //	intra_cursor_bytes || crc32(list_checksum)
 //
-// list_checksum is crc32 over the sorted entitlement IDs in the
-// request — if the caller changes the entitlement list between
-// pages we detect the mismatch and restart from the beginning
-// rather than silently mis-paginate.
-func (a *Adapter) ListGrantsForEntitlements(
+// list_checksum is crc32 over the entitlement IDs in REQUEST
+// ORDER — the cursor resumes by positional index, so a reorder is
+// as fatal as a drop/add; any change to the list (including order)
+// restarts from the beginning rather than silently mis-paginating.
+func (e *Engine) ListGrantsForEntitlements(
 	ctx context.Context,
 	req *reader_v2.GrantsReaderServiceListGrantsForEntitlementsRequest,
 ) (*reader_v2.GrantsReaderServiceListGrantsForEntitlementsResponse, error) {
-	syncID, err := a.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	records, next, err := e.listGrantsForEntitlements(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	out := make([]*v2.Grant, 0, len(records))
+	for _, rec := range records {
+		out = append(out, V3GrantToV2(rec))
+	}
+	return reader_v2.GrantsReaderServiceListGrantsForEntitlementsResponse_builder{
+		List:          out,
+		NextPageToken: next,
+	}.Build(), nil
+}
+
+// listGrantsForEntitlementsRequest is the request both the reader_v2 and
+// reader_v3 ListGrantsForEntitlements RPCs take.
+type listGrantsForEntitlementsRequest interface {
+	GetAnnotations() []*anypb.Any
+	GetEntitlements() []*v2.Entitlement
+	GetPageSize() uint32
+	GetPageToken() string
+}
+
+func (e *Engine) listGrantsForEntitlements(ctx context.Context, req listGrantsForEntitlementsRequest) ([]*v3.GrantRecord, string, error) {
+	syncID, err := e.resolveActiveSyncForReader(ctx, req.GetAnnotations())
+	if err != nil {
+		return nil, "", err
+	}
 	if syncID == "" {
-		return nil, ErrNoCurrentSync
+		return nil, "", ErrNoCurrentSync
 	}
 	ents := req.GetEntitlements()
 	if len(ents) == 0 {
-		return reader_v2.GrantsReaderServiceListGrantsForEntitlementsResponse_builder{}.Build(), nil
+		return nil, "", nil
 	}
 	limit := int(req.GetPageSize())
 	if limit <= 0 {
@@ -54,17 +82,23 @@ func (a *Adapter) ListGrantsForEntitlements(
 
 	startIdx, startIntra, err := decodeBatchCursor(req.GetPageToken(), listChecksum)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	out := make([]*v2.Grant, 0, limit)
+	out := make([]*v3.GrantRecord, 0, limit)
 	var nextToken string
 
 EntitlementLoop:
 	for i := startIdx; i < len(ents); i++ {
-		entID := ents[i].GetId()
-		if entID == "" {
+		if ents[i].GetId() == "" {
 			continue
+		}
+		entID, err := e.entitlementIdentityForRequest(ctx, ents[i])
+		if err != nil {
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue // unknown entitlement → no grants
+			}
+			return nil, "", err
 		}
 		intraCursor := ""
 		if i == startIdx {
@@ -72,39 +106,19 @@ EntitlementLoop:
 		}
 		for len(out) < limit {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return nil, "", err
 			}
-			remaining := limit - len(out)
-			records, next, err := a.engine.PaginateGrantsByEntitlement(ctx, syncID, entID, intraCursor, remaining)
+			records, next, err := e.PaginateGrantsByEntitlement(ctx, entID, intraCursor, limit-len(out))
 			if err != nil {
-				return nil, err
+				return nil, "", c1zstore.AdaptNotFound(err, pebble.ErrNotFound)
 			}
-			brokeEarly := false
-			var lastIntra string
-			for _, rec := range records {
-				out = append(out, V3GrantToV2(rec))
-				if len(out) == limit {
-					p := rec.GetPrincipal()
-					idBytes, encErr := a.engine.resolveSyncBytes(syncID)
-					if encErr != nil {
-						return nil, encErr
-					}
-					lastIntra = encodeCursor(encodeGrantByEntitlementIndexKey(
-						idBytes,
-						entID,
-						p.GetResourceTypeId(), p.GetResourceId(),
-						rec.GetExternalId(),
-					))
-					brokeEarly = true
-					break
-				}
-			}
-			if brokeEarly {
-				nextToken = encodeBatchCursor(i, lastIntra, listChecksum)
-				break EntitlementLoop
-			}
+			out = append(out, records...)
 			if next == "" || len(records) == 0 {
 				break
+			}
+			if len(out) == limit {
+				nextToken = encodeBatchCursor(i, next, listChecksum)
+				break EntitlementLoop
 			}
 			intraCursor = next
 		}
@@ -117,26 +131,21 @@ EntitlementLoop:
 			break
 		}
 	}
-
-	return reader_v2.GrantsReaderServiceListGrantsForEntitlementsResponse_builder{
-		List:          out,
-		NextPageToken: nextToken,
-	}.Build(), nil
+	return out, nextToken, nil
 }
 
-// entitlementListChecksum hashes the sorted entitlement ID set so
-// it is stable across client-side reorderings. If the caller drops
-// or adds an entitlement between pages the checksum changes and
-// decodeBatchCursor rejects the cursor.
+// entitlementListChecksum hashes the entitlement ID list IN REQUEST
+// ORDER. The cursor resumes by positional index into the list, so a
+// reordering is just as fatal to the resume as a drop or an add — a
+// sorted (order-insensitive) checksum would bless a reorder while the
+// index resumed over a different entitlement, re-returning some and
+// silently skipping others. Any change to the list, including order,
+// changes the checksum and decodeBatchCursor restarts from the
+// beginning.
 func entitlementListChecksum(ents []*v2.Entitlement) uint32 {
-	ids := make([]string, 0, len(ents))
-	for _, e := range ents {
-		ids = append(ids, e.GetId())
-	}
-	sort.Strings(ids)
 	h := crc32.NewIEEE()
-	for _, id := range ids {
-		_, _ = h.Write([]byte(id))
+	for _, e := range ents {
+		_, _ = h.Write([]byte(e.GetId()))
 		_, _ = h.Write([]byte{0})
 	}
 	return h.Sum32()
@@ -151,7 +160,7 @@ func encodeBatchCursor(idx int, intra string, listChecksum uint32) string {
 	if idx < 0 {
 		idx = 0
 	}
-	n := binary.PutUvarint(v[:], uint64(idx))
+	n := binary.PutUvarint(v[:], uint64(idx)) // #nosec G115 -- idx is normalized non-negative; int values fit in uint64.
 	buf = append(buf, v[:n]...)
 	intraBytes := []byte(intra)
 	n = binary.PutUvarint(v[:], uint64(len(intraBytes)))
@@ -185,7 +194,10 @@ func decodeBatchCursor(token string, currentChecksum uint32) (int, string, error
 		return 0, "", errors.New("ListGrantsForEntitlements: cursor missing intra length")
 	}
 	raw = raw[n:]
-	if uint64(len(raw)) < lenU+4 {
+	// Guard each term separately: lenU is attacker-controlled and lenU+4
+	// can wrap around uint64, which would pass a combined comparison and
+	// panic on the slice below.
+	if lenU > uint64(len(raw)) || uint64(len(raw))-lenU < 4 {
 		return 0, "", errors.New("ListGrantsForEntitlements: cursor truncated")
 	}
 	intra := string(raw[:lenU])

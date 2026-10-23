@@ -6,17 +6,16 @@ import (
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
+	reader_v3 "github.com/conductorone/baton-sdk/pb/c1/reader/v3"
 )
 
 type SyncType string
 
 const (
-	SyncTypeFull             SyncType = "full"
-	SyncTypePartial          SyncType = "partial"
-	SyncTypeResourcesOnly    SyncType = "resources_only"
-	SyncTypePartialUpserts   SyncType = "partial_upserts"   // Diff sync: additions and modifications
-	SyncTypePartialDeletions SyncType = "partial_deletions" // Diff sync: deletions
-	SyncTypeAny              SyncType = ""
+	SyncTypeFull          SyncType = "full"
+	SyncTypePartial       SyncType = "partial"
+	SyncTypeResourcesOnly SyncType = "resources_only"
+	SyncTypeAny           SyncType = ""
 )
 
 var AllSyncTypes = []SyncType{
@@ -24,8 +23,6 @@ var AllSyncTypes = []SyncType{
 	SyncTypeFull,
 	SyncTypePartial,
 	SyncTypeResourcesOnly,
-	SyncTypePartialUpserts,
-	SyncTypePartialDeletions,
 }
 
 // StoreMetadata describes the storage backing a Reader. Returned by
@@ -39,7 +36,7 @@ var AllSyncTypes = []SyncType{
 // unless the value is recognized.
 type StoreMetadata struct {
 	// Engine identifies the storage backend. Values match
-	// dotc1z.Engine string values; using string here keeps
+	// c1zstore.Engine string values; using string here keeps
 	// connectorstore from depending on dotc1z (avoids an import
 	// cycle).
 	//   "sqlite" — original .c1z, v1 magic + zstd-compressed SQLite
@@ -56,7 +53,7 @@ type StoreMetadata struct {
 
 	// PayloadEncoding identifies the v3 envelope payload framing.
 	// Empty for v1 / SQLite. Values match
-	// dotc1z.PayloadEncoding.String():
+	// c1zstore.PayloadEncoding.String():
 	//   "tar_zstd" — Pebble checkpoint as zstd-compressed tar
 	//   "tar"      — Pebble checkpoint as uncompressed tar
 	//   ""         — N/A or unset
@@ -105,6 +102,121 @@ type LatestFinishedSyncIDFetcher interface {
 	LatestFinishedSyncID(ctx context.Context, syncType SyncType) (string, error)
 }
 
+// GrantDigest is the root of an entitlement's grant digest: a
+// content-defined hash over all of the entitlement's grants plus the
+// grant count. Two entitlements (in the same or different c1z files)
+// with the same Count and Hash hold the same set of grants.
+type GrantDigest struct {
+	// Hash is the digest of every grant under the entitlement. Opaque
+	// bytes — compare for equality, don't interpret. Empty when Count
+	// is 0.
+	Hash []byte
+	// Count is the number of grants under the entitlement.
+	Count int64
+	// Level is the digest's native (stored) rollup level: the leaf
+	// granularity it was built at, expressed as a count of
+	// principal-hash bits, so the leaf level holds up to 2^Level
+	// buckets. Level 0 means only the root is stored (small or empty
+	// entitlements). It is the finest level GetEntitlementGrantDigestNodes
+	// can serve cheaply (by folding the stored leaves); a finer level
+	// would require a full grant-index scan.
+	Level int
+}
+
+// GrantDigestNode is one bucket of an entitlement's grant digest at a
+// requested rollup level: a content hash + grant count over the grants
+// whose principal-hash falls in that bucket.
+type GrantDigestNode struct {
+	// Index is the bucket index, in [0, 2^level). For level >= 1 nodes
+	// are returned sparsely and in ascending Index — only non-empty
+	// buckets appear, so a returned leaf node always has Count > 0. (At
+	// level 0 the single root node is always returned, even with
+	// Count 0.)
+	Index uint32
+	// Hash is the digest over the bucket's grants.
+	Hash []byte
+	// Count is the number of grants in the bucket.
+	Count int64
+}
+
+// GrantDigestBucket addresses one rollup bucket of an entitlement's
+// grant digest: the grants whose principal-hash falls under Index at the
+// given Level (2^Level buckets; Level 0 = the whole entitlement, Index
+// ignored). Index is exactly a GrantDigestNode.Index returned by
+// GetEntitlementGrantDigestNodes at the same Level — list nodes to find
+// the buckets, then scan the ones you want.
+type GrantDigestBucket struct {
+	// Level is the bucket width in principal-hash bits (2^Level buckets);
+	// 0 = the whole entitlement.
+	Level int
+	// Index is the bucket index in [0, 2^Level); ignored when Level == 0.
+	Index uint32
+}
+
+// EntitlementGrantDigestReader is an optional Reader capability that
+// returns the precomputed grant digest for an entitlement. It is
+// engine-specific: only the Pebble engine maintains the digest, so
+// callers must type-assert and fall back when the assertion fails or
+// found is false.
+//
+// Digests are keyed by the entitlement's STRUCTURAL identity —
+// (resource_type_id, resource_id, entitlement id) — so every method
+// takes a *v2.Entitlement stub, the same addressing the grants-for-
+// entitlement readers use. Pass the resource ref when you have it (any
+// caller iterating entitlement records does): identity then derives
+// exactly from the structured parts, with no lookup and no ambiguity.
+// A stub carrying only the Id falls back to bare-id resolution under
+// the exactly-one rule; an id that matches entitlements on more than
+// one resource is an error, never a guess. A nil stub or empty Id is
+// an error.
+//
+// found is false when the reader has no digest built for the
+// entitlement (it was never synced, the file predates / opted out of
+// the digest index — see WithGrantDigestIndex — or a bare id resolved
+// to nothing). A nil error with found=false means "no digest", not
+// "error".
+type EntitlementGrantDigestReader interface {
+	// GetEntitlementGrantDigest returns the entitlement's digest root —
+	// the whole-entitlement hash + grant count, plus the digest's native
+	// rollup Level. One key read.
+	GetEntitlementGrantDigest(ctx context.Context, entitlement *v2.Entitlement) (digest GrantDigest, found bool, err error)
+
+	// GetEntitlementGrantDigestNodes lists the digest's rollup nodes for
+	// the entitlement at `level`: 2^level principal-hash buckets, with
+	// level 0 returning a single node (the root) covering the whole
+	// entitlement.
+	//
+	// For 0 <= level <= the native Level (GrantDigest.Level) this folds
+	// the stored leaves — one contiguous scan of the digest keyspace, no
+	// grant-index scan. For a finer level, up to the principal-hash's
+	// resolution, it falls back to scanning the grant index directly
+	// (O(grants)) — slower, but exact. A level outside that resolution
+	// (a negative level, or one past the implementation's bucket-hash
+	// width — any level <= the digest's native Level is always in range;
+	// the Pebble engine exports its full width as DigestBucketHashBits)
+	// errors rather than silently serving the maximum resolution:
+	// a caller that placed its own records by hash (e.g. the Pebble
+	// engine's PrincipalDigestBucket) must get the same bucket set the
+	// engine reports, not a quietly coarser one. found is false when no
+	// digest exists.
+	GetEntitlementGrantDigestNodes(ctx context.Context, entitlement *v2.Entitlement, level int) (nodes []GrantDigestNode, found bool, err error)
+
+	// ScanEntitlementGrantBucket yields every grant in one digest bucket
+	// of the entitlement (see GrantDigestBucket) as a v2.Grant, stopping
+	// early if yield returns false. Bucket Level 0 scans the whole
+	// entitlement; a Level outside the bucket-hash resolution errors
+	// (matching GetEntitlementGrantDigestNodes) rather than clamping,
+	// and an Index outside [0, 2^Level) errors rather than wrapping —
+	// silently folding either coordinate would scan a bucket other than
+	// the one addressed. It reads the grant hash index,
+	// which exists only on files whose digest was built (they are
+	// derived together at seal): callers must check
+	// GetEntitlementGrantDigest first and treat found=false as "scan
+	// unavailable — read the grants directly", not as "no grants". It
+	// yields nothing when there is no active sync or no matching grants.
+	ScanEntitlementGrantBucket(ctx context.Context, entitlement *v2.Entitlement, bucket GrantDigestBucket, yield func(grant *v2.Grant) bool) error
+}
+
 // DBSizeProvider is an optional capability for a store that can report its
 // current uncompressed working-set size (e.g. dotc1z.C1File stat'ing its
 // sqlite file). Consumed by the syncer's ProgressLog to include
@@ -114,6 +226,35 @@ type LatestFinishedSyncIDFetcher interface {
 // there.
 type DBSizeProvider interface {
 	CurrentDBSizeBytes() (int64, error)
+}
+
+// ExpansionGrantLister is an optional capability for stores whose ListGrants
+// strips the GrantExpandable annotation into a side column on write (the SQLite
+// engine does; see dotc1z). ListGrantsWithExpansion is the paginated read that
+// re-attaches it, so a copy/sanitize that keeps ListGrants' resumable
+// page-cursor semantics (rather than switching to StreamGrants) still preserves
+// the grant-expansion topology end-to-end. Mirrors
+// StreamGrantsOptions.IncludeExpansion for the unary paginated read path.
+// Discovered by type assertion; readers that don't strip expansion (e.g. the
+// Pebble adapter, whose ListGrants already carries it) need not implement it.
+type ExpansionGrantLister interface {
+	ListGrantsWithExpansion(ctx context.Context, request *v2.GrantsServiceListGrantsRequest) (*v2.GrantsServiceListGrantsResponse, error)
+}
+
+// V3GrantReader serves grants as the rich c1.storage.v3.GrantRecord rather
+// than the lossy v2.Grant downshift (which drops fields like discovered_at).
+// Optional and Pebble-only. Discover it via V3GrantReaderProvider, not by
+// asserting this interface on the store directly: its RPC names collide with
+// the required reader_v2 methods the store already carries, and Go has no
+// method overloading.
+type V3GrantReader interface {
+	reader_v3.GrantsReaderServiceServer
+}
+
+// V3GrantReaderProvider is the type-assertion entry point for V3GrantReader
+// (Pebble only); callers fall back to the v2 reader when it is absent.
+type V3GrantReaderProvider interface {
+	V3GrantReader() V3GrantReader
 }
 
 // GrantUpsertMode controls how grant conflicts are resolved during upsert.

@@ -8,18 +8,27 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"time"
 
+	"github.com/conductorone/baton-sdk/internal/atomicfile"
+	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
+	enginepkg "github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble"
 	"github.com/conductorone/baton-sdk/pkg/sdk"
 	"github.com/conductorone/baton-sdk/pkg/sync"
+	"github.com/conductorone/baton-sdk/pkg/sync/expand"
 	"github.com/conductorone/baton-sdk/pkg/synccompactor/attached"
 	"github.com/conductorone/baton-sdk/pkg/tempdir"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
@@ -35,7 +44,7 @@ const (
 type Compactor struct {
 	compactorType CompactorType
 	entries       []*CompactableSync
-	compactedC1z  dotc1z.C1ZStore
+	compactedC1z  c1zstore.Store
 
 	tmpDir             string
 	destDir            string
@@ -43,20 +52,132 @@ type Compactor struct {
 	syncLimit          int
 	c1zOptions         []dotc1z.C1ZOption
 	skipGrantExpansion bool
+	failFastInvariants bool
+	// incrementalExpansion enables diff-aware expansion. The compactor loads the
+	// graph itself from entries[0], so callers cannot pair a graph with the wrong
+	// artifact. incrementalBaseGraph holds that validated, store-loaded graph.
+	// The set of changed entitlements is derived from the applied increments
+	// during expansion, not supplied by the caller.
+	incrementalExpansion bool
+	incrementalBaseGraph *expand.EntitlementGraph
+	// incrementalExpansionRan records whether the diff-aware path actually
+	// handled expansion (vs falling back to full). Read by tests to prove the
+	// fast path ran rather than silently falling back.
+	incrementalExpansionRan bool
+	// incrementalTestHook is a package-private fault seam used by crash/retry
+	// tests. Production compactions leave it nil.
+	incrementalTestHook func(stage string) error
+	// foldChangedEntitlementIDs: changed-entitlement set collected by the
+	// Pebble fold; nil when no fold ran (derive fallback).
+	foldChangedEntitlementIDs map[string]struct{}
 	// engine selects the storage engine for the compacted output.
-	// Empty means EngineSQLite (the default; behavior is unchanged and
-	// the output is byte-identical to the pre-engine-option compactor).
-	// EnginePebble produces a v3 Pebble c1z via a native record merge.
-	engine dotc1z.Engine
+	// Empty means "follow the inputs": Compact resolves it via
+	// inferEngineFromInputs (any Pebble input → Pebble, all-SQLite →
+	// SQLite), so the compactor does NOT follow the dotc1z engine
+	// default. EnginePebble produces a v3 Pebble c1z via a native
+	// record merge.
+	engine c1zstore.Engine
+	// pebbleMode optionally forces the Pebble merge strategy; the zero
+	// value (Auto) lets the compactor choose. See WithPebbleCompactorMode.
+	pebbleMode PebbleCompactorMode
+	// overlaySeenKeyLimit / overlayRecordChunkSize /
+	// overlayBufferFactor / overlayGateFraction optionally override
+	// the overlay merge tunables; zero means the merge defaults. See
+	// WithOverlaySeenKeyLimit / WithOverlayRecordChunkSize /
+	// WithOverlayBufferFactor / WithOverlayGateFraction.
+	overlaySeenKeyLimit    int64
+	overlayRecordChunkSize int
+	overlayBufferFactor    float64
+	overlayGateFraction    float64
+	// foldMaxWastePct optionally overrides the fold waste cutover
+	// (accumulated fold dead bytes as a percent of the base's live
+	// payload bytes, above which auto mode forces an overlay rebuild).
+	// Zero means the default; see WithFoldMaxWastePercent.
+	foldMaxWastePct int64
+	// decoderPool scopes v3 payload-decoder reuse to one Compact run:
+	// every source envelope open draws from it instead of constructing
+	// a fresh zstd decoder, and Compact closes it on the way out so no
+	// decoder buffers outlive the compaction (deliberately NOT a
+	// process-global pool — see dotc1z.WithDecoderPool).
+	decoderPool *dotc1z.EnvelopeDecoderPool
 }
 
 // resolvedEngine returns the configured engine, treating the zero value
-// as EngineSQLite.
-func (c *Compactor) resolvedEngine() dotc1z.Engine {
+// as EngineSQLite. Compact calls inferEngineFromInputs first so the zero
+// value can follow existing c1z inputs instead of always producing SQLite.
+func (c *Compactor) resolvedEngine() c1zstore.Engine {
 	if c.engine == "" {
-		return dotc1z.EngineSQLite
+		return c1zstore.EngineSQLite
 	}
 	return c.engine
+}
+
+// ErrEnginePolicyConflict is returned when the caller explicitly requests
+// SQLite output but one or more inputs are Pebble/v3 format. Pebble inputs
+// cannot be re-encoded as SQLite without a full data-layer conversion, so
+// the combination is rejected rather than silently downgrading.
+var ErrEnginePolicyConflict = errors.New("compactor: engine policy conflict: cannot compact Pebble input to SQLite output")
+
+// inferEngineFromInputs determines the output engine for a compaction run
+// when no engine was explicitly set by the caller (WithEngine).
+//
+// Policy (evaluated in order):
+//  1. Explicit engine set via WithEngine: honored, subject to the Pebble-input
+//     constraint below.
+//  2. Any input is Pebble/v3: output is Pebble, regardless of whether other
+//     inputs are SQLite/v1 (mixed inputs produce Pebble). SQLite inputs in a
+//     Pebble run are converted to Pebble automatically; callers are not
+//     required to pre-convert.
+//  3. All inputs are SQLite/v1: output is SQLite.
+//
+// Constraint: an explicit SQLite request (WithEngine(EngineSQLite)) when any
+// input is Pebble/v3 returns ErrEnginePolicyConflict.
+func (c *Compactor) inferEngineFromInputs() (c1zstore.Engine, error) {
+	hasPebble := false
+	hasSQLite := false
+	for _, entry := range c.entries {
+		if entry == nil || entry.FilePath == "" {
+			continue
+		}
+		f, err := os.Open(entry.FilePath) // #nosec G304,G703 -- compaction inputs are intentionally caller-provided c1z paths.
+		if err != nil {
+			return "", fmt.Errorf("infer compactor engine from %s: %w", entry.FilePath, err)
+		}
+		format, readErr := dotc1z.ReadHeaderFormat(f)
+		closeErr := f.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("infer compactor engine from %s: %w", entry.FilePath, readErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("infer compactor engine from %s: %w", entry.FilePath, closeErr)
+		}
+		switch format {
+		case dotc1z.C1ZFormatV1:
+			hasSQLite = true
+		case dotc1z.C1ZFormatV3:
+			hasPebble = true
+		default:
+			return "", fmt.Errorf("infer compactor engine from %s: unsupported c1z format %s", entry.FilePath, format)
+		}
+	}
+
+	// Explicit engine: validate and return.
+	if c.engine != "" {
+		if c.engine == c1zstore.EngineSQLite && hasPebble {
+			return "", fmt.Errorf("%w: caller requested SQLite but at least one input is Pebble/v3", ErrEnginePolicyConflict)
+		}
+		return c.engine, nil
+	}
+
+	// Auto-select: any Pebble input → Pebble output.
+	if hasPebble {
+		return c1zstore.EnginePebble, nil
+	}
+	if hasSQLite {
+		return c1zstore.EngineSQLite, nil
+	}
+	// No readable inputs: default to SQLite to preserve historical behavior.
+	return c1zstore.EngineSQLite, nil
 }
 
 type CompactableSync struct {
@@ -73,6 +194,22 @@ type Option func(*Compactor)
 func WithTmpDir(tempDir string) Option {
 	return func(c *Compactor) {
 		c.tmpDir = tempDir
+	}
+}
+
+// WithIncrementalExpansion enables diff-aware grant expansion during compaction.
+// The compactor loads the graph from entries[0] via sync.GraphFromStore;
+// missing, stale, incomplete, or inconsistent graphs safely fall back. The set of
+// entitlements whose membership changed is derived from the applied increments
+// during expansion (not supplied by the caller), so new members propagate. A
+// new edge that closes a cycle falls back to full expansion; nil baseGraph
+// (default) = full.
+//
+// Additions-only: a revocation-shaped change (a narrowed edge spec) auto-declines
+// to full expansion; removals are not propagated incrementally.
+func WithIncrementalExpansion() Option {
+	return func(c *Compactor) {
+		c.incrementalExpansion = true
 	}
 }
 
@@ -112,11 +249,37 @@ func WithSkipGrantExpansion() Option {
 	}
 }
 
+// WithFailFastInvariants promotes every ingestion-invariant verdict to a hard
+// failure on both incremental and full expansion paths.
+func WithFailFastInvariants() Option {
+	return func(c *Compactor) {
+		c.failFastInvariants = true
+	}
+}
+
+// syncIDPattern bounds a CompactableSync.SyncID to the shape the SDK itself
+// mints (KSUIDs; see dotc1z sync-run id minting). SyncIDs participate in
+// working-artifact filename construction (compacted-%s.c1z), so a
+// separator-bearing id would escape the compactor's private temp dir via
+// path.Join's Clean(). On resume paths the id can originate from a
+// connector-supplied artifact's sync_runs table, so it is untrusted input.
+var syncIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
 func NewCompactor(ctx context.Context, outputDir string, compactableSyncs []*CompactableSync, opts ...Option) (*Compactor, func() error, error) {
 	if len(compactableSyncs) < 2 {
 		return nil, nil, ErrNotEnoughFilesToCompact
 	}
-
+	for _, e := range compactableSyncs {
+		if e == nil {
+			return nil, nil, fmt.Errorf("synccompactor: nil compactable sync entry")
+		}
+		// An empty SyncID is a valid sentinel meaning "resolve the latest
+		// sync"; every non-empty id must be a plain token so it cannot
+		// carry path separators into working-artifact filename construction.
+		if e.SyncID != "" && !syncIDPattern.MatchString(e.SyncID) {
+			return nil, nil, fmt.Errorf("synccompactor: invalid sync id %q: must match %v", e.SyncID, syncIDPattern)
+		}
+	}
 	c := &Compactor{
 		entries:       compactableSyncs,
 		destDir:       outputDir,
@@ -162,10 +325,10 @@ func NewCompactor(ctx context.Context, outputDir string, compactableSyncs []*Com
 	return c, cleanup, nil
 }
 
-func (c *Compactor) Compact(ctx context.Context) (*CompactableSync, error) {
+func (c *Compactor) Compact(ctx context.Context) (_ *CompactableSync, retErr error) {
 	ctx, span := tracer.Start(ctx, "Compactor.Compact")
 	var err error
-	defer func() { uotel.EndSpanWithError(span, err) }()
+	defer func() { uotel.EndSpanWithError(span, retErr) }()
 	if len(c.entries) < 2 {
 		return nil, nil
 	}
@@ -200,17 +363,67 @@ func (c *Compactor) Compact(ctx context.Context) (*CompactableSync, error) {
 	if c.syncLimit > 0 {
 		opts = append(opts, dotc1z.WithSyncLimit(c.syncLimit))
 	}
+	engine, err := c.inferEngineFromInputs()
+	if err != nil {
+		return nil, err
+	}
+	c.engine = engine
 
 	fileName := fmt.Sprintf("compacted-%s.c1z", c.entries[0].SyncID)
 	destFilePath := path.Join(c.tmpDir, fileName)
 
-	if c.resolvedEngine() == dotc1z.EnginePebble {
-		// Force the resolved engine last so a stray engine passed via
-		// WithC1ZOptions cannot mislabel the artifact.
-		c.compactedC1z, err = dotc1z.NewStore(ctx, destFilePath, append(opts, dotc1z.WithEngine(dotc1z.EnginePebble))...)
-	} else {
-		c.compactedC1z, err = dotc1z.NewStore(ctx, destFilePath, opts...)
+	// Resolve the Pebble strategy up front: an explicit
+	// BATON_EXPERIMENTAL_PEBBLE_COMPACTOR value forces a mode;
+	// otherwise the size gate picks fold (large base, small partials)
+	// or overlay (everything else); see resolvePebbleMode.
+	//
+	// In-place fold: the dest store starts as a copy of the base input
+	// and partials are merged into the base keyspace via keep-newer
+	// writes; the folded output is then re-keyed to a fresh sync id.
+	// The original base file is never mutated. See compactPebbleFold.
+	if c.resolvedEngine() == c1zstore.EnginePebble {
+		c.pebbleMode = c.resolvePebbleMode(ctx)
 	}
+	foldMode := c.pebbleMode == PebbleCompactorModeFold
+	if foldMode {
+		// Fold merges partials in place into a private copy of the base, so
+		// only the BASE must already be Pebble: converting the base would
+		// mean rewriting the whole base, which defeats fold's point. SQLite
+		// partials are fine — they are converted to Pebble inside the fold
+		// loop. When the base itself is SQLite/v1, fall back to the overlay
+		// path, which converts every input before merging.
+		baseFormat, ferr := readCompactionInputFormat(c.entries[0].FilePath)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if baseFormat != dotc1z.C1ZFormatV3 {
+			foldMode = false
+			c.pebbleMode = PebbleCompactorModeOverlay
+		}
+	}
+	if foldMode {
+		if err = copyFileForFold(c.entries[0].FilePath, destFilePath); err != nil {
+			return nil, fmt.Errorf("fold: copy base input: %w", err)
+		}
+	}
+
+	if c.resolvedEngine() == c1zstore.EnginePebble {
+		// One payload-decoder pool for the whole compaction: the merge
+		// opens every source's envelope (selection + per-chunk unpack),
+		// and reusing one decoder across those opens avoids a fresh
+		// window allocation + worker spin-up per source. Closed when
+		// Compact returns so nothing is retained by the process after.
+		c.decoderPool = dotc1z.NewEnvelopeDecoderPool()
+		defer c.decoderPool.Close()
+		opts = append(opts, dotc1z.WithDecoderPool(c.decoderPool))
+	}
+
+	// Force the resolved engine last: a stray engine passed via
+	// WithC1ZOptions cannot mislabel the artifact, and the dotc1z
+	// engine default (Pebble) cannot leak into a SQLite compaction —
+	// the destination is a new file, so an engine-less open would
+	// otherwise create a v3 store under the SQLite merge path.
+	c.compactedC1z, err = dotc1z.NewStore(ctx, destFilePath, append(opts, dotc1z.WithEngine(c.resolvedEngine()))...)
 	if err != nil {
 		l.Error("doOneCompaction failed: could not create c1z file", zap.Error(err))
 		return nil, err
@@ -219,34 +432,43 @@ func (c *Compactor) Compact(ctx context.Context) (*CompactableSync, error) {
 		if c.compactedC1z == nil {
 			return
 		}
-		err := c.compactedC1z.Close(ctx)
-		if err != nil {
-			l.Error("compactor: error closing compacted c1z", zap.Error(err), zap.String("compacted_c1z_file", destFilePath))
+		if closeErr := c.compactedC1z.Close(ctx); closeErr != nil {
+			l.Error("compactor: error closing compacted c1z", zap.Error(closeErr), zap.String("compacted_c1z_file", destFilePath))
+			retErr = joinCompactorCloseError(retErr, closeErr, destFilePath)
 		}
 	}()
-	// Start new sync of type partial. If we compact syncs of other types, this sync type will be updated by attached.UpdateSync which is called by doOneCompaction().
-	newSyncId, err := c.compactedC1z.StartNewSync(ctx, connectorstore.SyncTypePartial, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to start new sync: %w", err)
-	}
-	err = c.compactedC1z.EndSync(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to end sync: %w", err)
-	}
-	l.Debug("new empty partial sync created", zap.String("sync_id", newSyncId))
-
-	if c.resolvedEngine() == dotc1z.EnginePebble {
-		// Native Pebble path: one multi-source record merge into the
-		// empty newSyncId (the sqlite ATTACH per-input loop does not
-		// apply — Pebble merges all inputs in a single pass).
-		if err = c.compactPebble(runCtx, newSyncId); err != nil {
+	var newSyncId string
+	switch {
+	case foldMode:
+		// No StartNewSync: partials merge under the base id and the fold renames
+		// the sync-run record at the end.
+		newSyncId, err = c.compactPebbleFold(runCtx)
+		if err != nil {
+			if cause := context.Cause(runCtx); errors.Is(cause, context.DeadlineExceeded) && c.runDuration > 0 && ctx.Err() == nil {
+				l.Info("compaction run duration has expired, exiting compaction early")
+				return nil, fmt.Errorf("compaction run duration has expired: %w", cause)
+			}
+			return nil, fmt.Errorf("failed to compact (pebble fold): %w", err)
+		}
+	case c.resolvedEngine() == c1zstore.EnginePebble:
+		newSyncId, err = c.runPebbleRebuild(ctx, runCtx)
+		if err != nil {
 			if cause := context.Cause(runCtx); errors.Is(cause, context.DeadlineExceeded) && c.runDuration > 0 && ctx.Err() == nil {
 				l.Info("compaction run duration has expired, exiting compaction early")
 				return nil, fmt.Errorf("compaction run duration has expired: %w", cause)
 			}
 			return nil, fmt.Errorf("failed to compact (pebble): %w", err)
 		}
-	} else {
+	default:
+		// Start new sync of type partial. If we compact syncs of other types, this sync type will be updated by attached.UpdateSync which is called by doOneCompaction().
+		newSyncId, err = c.compactedC1z.StartNewSync(ctx, connectorstore.SyncTypePartial, "")
+		if err != nil {
+			return nil, fmt.Errorf("failed to start new sync: %w", err)
+		}
+		if err = c.compactedC1z.EndSync(ctx); err != nil {
+			return nil, fmt.Errorf("failed to end sync: %w", err)
+		}
+		l.Debug("new empty partial sync created", zap.String("sync_id", newSyncId))
 		// Base sync is c.entries[0], so compact in reverse order. That way we compact the biggest sync last.
 		// Pass runCtx (not the outer ctx) so c.runDuration actually bounds the loop. Without this, the
 		// deadline set on runCtx only gates the pre-flight check above and individual doOneCompaction
@@ -308,10 +530,20 @@ func (c *Compactor) Compact(ctx context.Context) (*CompactableSync, error) {
 		c.compactedC1z = nil
 	}
 
+	if c.incrementalExpansionRan {
+		if err := c.runIncrementalTestHook("before_publish"); err != nil {
+			return nil, err
+		}
+	}
 	// Move last compacted file to the destination dir
 	finalPath := path.Join(c.destDir, fmt.Sprintf("compacted-%s.c1z", newSyncId))
 	if err := cpFile(ctx, destFilePath, finalPath); err != nil {
 		return nil, err
+	}
+	if c.incrementalExpansionRan {
+		if err := c.runIncrementalTestHook("after_publish"); err != nil {
+			return nil, err
+		}
 	}
 
 	if !filepath.IsAbs(finalPath) {
@@ -324,8 +556,15 @@ func (c *Compactor) Compact(ctx context.Context) (*CompactableSync, error) {
 	return &CompactableSync{FilePath: finalPath, SyncID: newSyncId}, nil
 }
 
+func joinCompactorCloseError(retErr, closeErr error, artifactPath string) error {
+	if closeErr == nil {
+		return retErr
+	}
+	return errors.Join(retErr, fmt.Errorf("close compacted c1z %s: %w", artifactPath, closeErr))
+}
+
 func cpFile(ctx context.Context, sourcePath string, destPath string) error {
-	err := os.Rename(sourcePath, destPath)
+	err := os.Rename(sourcePath, destPath) // #nosec G703 -- compaction source and destination paths are intentional API inputs.
 	if err == nil {
 		return nil
 	}
@@ -339,35 +578,19 @@ func cpFile(ctx context.Context, sourcePath string, destPath string) error {
 	}
 	defer source.Close()
 
-	destination, err := os.Create(destPath)
+	destination, err := atomicfile.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	destinationClosed := false
-	defer func() {
-		if !destinationClosed {
-			_ = destination.Close()
-		}
-	}()
+	defer destination.Cleanup()
 
 	_, err = io.Copy(destination, source)
 	if err != nil {
 		return fmt.Errorf("failed to copy file: %w", err)
 	}
-
-	// Sync + Close + err-check so write-back failures (out-of-disk,
-	// IO error, quota exhaustion) surface here rather than being
-	// silently discarded by the deferred Close after the function
-	// has reported success. Required because the compacted file is
-	// the canonical artifact downstream consumers read.
-	if err := destination.Sync(); err != nil {
-		return fmt.Errorf("failed to sync destination file: %w", err)
+	if err := destination.CloseAtomicallyReplace(); err != nil {
+		return fmt.Errorf("failed to write destination file: %w", err)
 	}
-	if err := destination.Close(); err != nil {
-		return fmt.Errorf("failed to close destination file: %w", err)
-	}
-	destinationClosed = true
-
 	return nil
 }
 
@@ -412,8 +635,667 @@ func (c *Compactor) doOneCompaction(ctx context.Context, cs *CompactableSync) er
 	return nil
 }
 
+// expandGrantsIncremental runs a diff-aware expansion over the compacted c1z.
+// errIncrementalFatal marks incremental-expansion errors that must FAIL the
+// compaction rather than fall back to full expansion: the store is mid-teardown
+// (or could not be restored to its ended state), so running the full path
+// against it is unsafe. Every other error is safe to fall back on — the store
+// was untouched or restored, and expanded-grant writes are idempotent.
+var errIncrementalFatal = errors.New("incremental expansion: fatal")
+
+// errIncrementalDroppedEdgeDecline keeps the public revocation contract while
+// giving observability a stable, more specific reason.
+var errIncrementalDroppedEdgeDecline = fmt.Errorf("%w: dropped edge", expand.ErrIncrementalRevocationDecline)
+
+// Returns (true, nil) when it handled expansion. Errors come in three shapes:
+// decline sentinels (ErrIncrementalFallback for a cycle,
+// ErrIncrementalRevocationDecline for a narrowed edge) and plain errors both
+// mean "fall back to full expansion" — the store is in the ended state the
+// full path expects; errors wrapped in errIncrementalFatal mean the store's
+// finalization failed and the compaction must fail. Finalization always runs
+// on a detached context so a run-duration timeout can't abort it.
+func (c *Compactor) expandGrantsIncremental(ctx context.Context, newSyncId string, compactionStart time.Time) (bool, error) {
+	// Classification only reads the caller-held graph. Defer the whale-sized
+	// clone until every cheap decline check passes; chronically ineligible
+	// inputs should not pay O(graph) memory and CPU before falling back.
+	base := c.incrementalBaseGraph
+	if err := base.ValidateCompleted(); err != nil {
+		return false, fmt.Errorf("incremental expansion: invalid base graph: %w", err)
+	}
+	if base.HasCollapsedCycles() {
+		return false, expand.ErrIncrementalFallback
+	}
+
+	// Bound the walk by the remaining run duration; the walk polls ctx.Err().
+	// Finalization uses detached contexts, so an expired walk deadline never
+	// aborts the end/cleanup/close.
+	walkCtx := ctx
+	if c.runDuration > 0 {
+		remaining := c.runDuration - time.Since(compactionStart)
+		if remaining <= 0 {
+			// Let the full path surface its canonical run-duration error.
+			return false, fmt.Errorf("incremental expansion: run duration expired before expansion")
+		}
+		var cancel context.CancelFunc
+		walkCtx, cancel = context.WithTimeout(ctx, remaining)
+		defer cancel()
+	}
+
+	// The merge left the sync ended; resume it so grants can be written (end +
+	// close on the way out). Fetch the type first so resume finds the existing sync.
+	syncResp, err := c.compactedC1z.GetSync(walkCtx, reader_v2.SyncsReaderServiceGetSyncRequest_builder{SyncId: newSyncId}.Build())
+	if err != nil {
+		return false, fmt.Errorf("incremental expansion: get sync: %w", err)
+	}
+	syncType := connectorstore.SyncType(syncResp.GetSync().GetSyncType())
+	// ResumeSync, never StartOrResumeSync: the merge just produced this sync, so
+	// a failed lookup is an error, not a cue to start a fresh one. On Pebble,
+	// StartOrResumeSync's fallback runs ResetForNewSync, which would wipe
+	// everything the merge wrote.
+	if _, err := c.compactedC1z.ResumeSync(walkCtx, syncType, newSyncId); err != nil {
+		return false, fmt.Errorf("incremental expansion: resume sync: %w", err)
+	}
+
+	// Every rule grant currently in the compacted c1z (base + merged
+	// increments) contributes to one or more edges. Multiple grants may describe
+	// different pieces of the SAME edge, so merge their specs before comparing
+	// them with the base graph. Comparing each piece independently turns an
+	// unchanged split filter (for example users + groups) into false narrowing.
+	currentEdges := make(map[[2]string]expand.NewEdge)
+	sourceEntitlements := make(map[string]*v2.Entitlement)
+	missingSourceEntitlements := make(map[string]struct{})
+	for pe, err := range c.compactedC1z.Grants().PendingExpansion(walkCtx) {
+		if err != nil {
+			if endErr := c.restoreEndedSync(ctx); endErr != nil {
+				return false, endErr
+			}
+			return false, fmt.Errorf("incremental expansion: enumerate pending: %w", err)
+		}
+		anno := pe.Annotation
+		if anno == nil {
+			continue
+		}
+		for _, src := range anno.GetEntitlementIds() {
+			if _, missing := missingSourceEntitlements[src]; missing {
+				continue
+			}
+			sourceEntitlement, cached := sourceEntitlements[src]
+			if !cached {
+				resp, getErr := c.compactedC1z.GetEntitlement(walkCtx,
+					reader_v2.EntitlementsReaderServiceGetEntitlementRequest_builder{
+						EntitlementId: src,
+					}.Build())
+				if status.Code(getErr) == codes.NotFound {
+					missingSourceEntitlements[src] = struct{}{}
+					ctxzap.Extract(ctx).Debug("incremental expansion: source entitlement not found, skipping edge",
+						zap.String("src_entitlement_id", src),
+						zap.String("dst_entitlement_id", pe.TargetEntitlementID))
+					continue
+				}
+				if getErr != nil {
+					if endErr := c.restoreEndedSync(ctx); endErr != nil {
+						return false, endErr
+					}
+					return false, fmt.Errorf("incremental expansion: get source entitlement %s: %w", src, getErr)
+				}
+				sourceEntitlement = resp.GetEntitlement()
+				sourceEntitlements[src] = sourceEntitlement
+			}
+
+			sourceResourceID := sourceEntitlement.GetResource().GetId()
+			if sourceResourceID == nil {
+				if endErr := c.restoreEndedSync(ctx); endErr != nil {
+					return false, endErr
+				}
+				return false, fmt.Errorf("incremental expansion: source entitlement resource id was nil")
+			}
+			if pe.PrincipalResourceTypeID != sourceResourceID.GetResourceType() ||
+				pe.PrincipalResourceID != sourceResourceID.GetResource() {
+				if endErr := c.restoreEndedSync(ctx); endErr != nil {
+					return false, endErr
+				}
+				return false, fmt.Errorf("incremental expansion: source entitlement resource id did not match grant principal id")
+			}
+
+			curEdge := expand.NewEdge{
+				SourceEntitlementID: src,
+				DestEntitlementID:   pe.TargetEntitlementID,
+				Shallow:             anno.GetShallow(),
+				ResourceTypeIDs:     anno.GetResourceTypeIds(),
+			}
+			key := [2]string{src, pe.TargetEntitlementID}
+			if existing, ok := currentEdges[key]; ok {
+				currentEdges[key] = mergeCurrentEdgeSpecs(existing, curEdge)
+			} else {
+				curEdge.ResourceTypeIDs = append([]string(nil), curEdge.ResourceTypeIDs...)
+				currentEdges[key] = curEdge
+			}
+		}
+	}
+
+	var newEdges []expand.NewEdge
+	currentBaseNodeEdges := make(map[[2]int]struct{})
+	currentEdgeKeys := make([][2]string, 0, len(currentEdges))
+	for key := range currentEdges {
+		currentEdgeKeys = append(currentEdgeKeys, key)
+	}
+	sort.Slice(currentEdgeKeys, func(i, j int) bool {
+		if currentEdgeKeys[i][0] != currentEdgeKeys[j][0] {
+			return currentEdgeKeys[i][0] < currentEdgeKeys[j][0]
+		}
+		return currentEdgeKeys[i][1] < currentEdgeKeys[j][1]
+	})
+	for _, key := range currentEdgeKeys {
+		curEdge := currentEdges[key]
+		srcNode := base.GetNode(curEdge.SourceEntitlementID)
+		dstNode := base.GetNode(curEdge.DestEntitlementID)
+		if srcNode != nil && dstNode != nil && srcNode.Id != dstNode.Id {
+			currentBaseNodeEdges[[2]int{srcNode.Id, dstNode.Id}] = struct{}{}
+		}
+		baseEdge, inBase := baseGraphEdge(base, curEdge.SourceEntitlementID, curEdge.DestEntitlementID)
+		if !inBase {
+			newEdges = append(newEdges, curEdge) // brand-new edge
+			continue
+		}
+		// Existing edge: compare its combined current spec with the combined
+		// spec persisted in the base graph.
+		switch classifyEdgeSpecChange(baseEdge, curEdge) {
+		case edgeSpecNarrowed:
+			// Revocation-shaped (shallow-ified / filter tightened): can't
+			// remove grants incrementally — decline via the named hook (#6).
+			if endErr := c.restoreEndedSync(ctx); endErr != nil {
+				return false, endErr
+			}
+			return false, expand.ErrIncrementalRevocationDecline
+		case edgeSpecWidened:
+			// More members now qualify: re-expand (AddEdge folds the wider
+			// spec into the graph, deep-wins/unfiltered-wins).
+			newEdges = append(newEdges, curEdge)
+		case edgeSpecUnchanged:
+			// nothing to do
+		}
+	}
+	// PendingExpansion describes the complete current edge set. Check the
+	// reverse direction too: a base edge missing from current data is a
+	// revocation-shaped change and cannot be applied incrementally.
+	for _, edge := range base.Edges {
+		if _, ok := currentBaseNodeEdges[[2]int{edge.SourceID, edge.DestinationID}]; ok {
+			continue
+		}
+		if endErr := c.restoreEndedSync(ctx); endErr != nil {
+			return false, endErr
+		}
+		return false, errIncrementalDroppedEdgeDecline
+	}
+
+	// Changed entitlements are derived from the applied increments (their
+	// grants' entitlement ids), not supplied by the caller — trust the data.
+	changedEntitlementIDs, err := c.changedEntitlementIDs(walkCtx)
+	if err != nil {
+		if endErr := c.restoreEndedSync(ctx); endErr != nil {
+			return false, endErr
+		}
+		return false, err
+	}
+
+	if len(newEdges) == 0 && len(changedEntitlementIDs) == 0 {
+		// Nothing changed relative to the base — its grants were already merged in.
+		base, err = base.Clone()
+		if err != nil {
+			if endErr := c.restoreEndedSync(ctx); endErr != nil {
+				return false, endErr
+			}
+			return false, fmt.Errorf("incremental expansion: clone base graph: %w", err)
+		}
+		verification, err := c.runIncrementalInvariants(walkCtx, newSyncId, syncType)
+		if err != nil {
+			if endErr := c.restoreEndedSync(ctx); endErr != nil {
+				return false, endErr
+			}
+			return false, err
+		}
+		return c.finishIncrementalExpansion(ctx, newSyncId, base, verification)
+	}
+
+	base, err = base.Clone()
+	if err != nil {
+		if endErr := c.restoreEndedSync(ctx); endErr != nil {
+			return false, endErr
+		}
+		return false, fmt.Errorf("incremental expansion: clone base graph: %w", err)
+	}
+	incrementalStore := sync.NewExpanderStore(c.compactedC1z)
+	if c.incrementalTestHook != nil {
+		incrementalStore = &incrementalFaultStore{ExpanderStore: incrementalStore, hook: c.incrementalTestHook}
+	}
+	ie := expand.NewIncrementalExpander(incrementalStore, base)
+	res, err := ie.ExpandChanges(walkCtx, newEdges, changedEntitlementIDs)
+	if err != nil {
+		// Restore the ended state so the full path re-runs against a consistent
+		// store — for the cycle decline and any real error alike. Writes are
+		// idempotent by grant identity, so partial progress is safe to re-cover.
+		if endErr := c.restoreEndedSync(ctx); endErr != nil {
+			return false, endErr
+		}
+		return false, err // sentinel or plain → caller falls back to full
+	}
+	if err := c.runIncrementalTestHook("after_walk"); err != nil {
+		return false, err
+	}
+
+	ctxzap.Extract(ctx).Info("incremental grant expansion complete",
+		zap.Int("entitlements_walked", len(res.EntitlementsWalked)),
+		zap.Int("grants_written", res.GrantsWritten))
+	verification, err := c.runIncrementalInvariants(walkCtx, newSyncId, syncType)
+	if err != nil {
+		if endErr := c.restoreEndedSync(ctx); endErr != nil {
+			return false, endErr
+		}
+		return false, err
+	}
+	return c.finishIncrementalExpansion(ctx, newSyncId, base, verification)
+}
+
+type incrementalFaultStore struct {
+	expand.ExpanderStore
+	hook  func(stage string) error
+	fired bool
+}
+
+func (s *incrementalFaultStore) StoreExpandedGrants(ctx context.Context, grants ...*v2.Grant) error {
+	if err := s.ExpanderStore.StoreExpandedGrants(ctx, grants...); err != nil {
+		return err
+	}
+	if !s.fired {
+		s.fired = true
+		if err := s.hook("mid_expand_write"); err != nil {
+			return fmt.Errorf("%w: injected failure at mid_expand_write: %w", errIncrementalFatal, err)
+		}
+	}
+	return nil
+}
+
+func (c *Compactor) runIncrementalTestHook(stage string) error {
+	if c.incrementalTestHook == nil {
+		return nil
+	}
+	if err := c.incrementalTestHook(stage); err != nil {
+		return fmt.Errorf("%w: injected failure at %s: %w", errIncrementalFatal, stage, err)
+	}
+	return nil
+}
+
+func (c *Compactor) runIncrementalInvariants(
+	ctx context.Context,
+	syncID string,
+	syncType connectorstore.SyncType,
+) (*c1zstore.IngestInvariantVerification, error) {
+	if writer, ok := c.compactedC1z.SyncMeta().(c1zstore.IngestInvariantVerificationWriter); ok {
+		if err := writer.ClearIngestInvariantVerification(ctx, syncID); err != nil {
+			return nil, fmt.Errorf("incremental expansion: clear invariant verification: %w", err)
+		}
+	}
+	verification, err := sync.RunIngestInvariantsWithVerification(ctx, c.compactedC1z, sync.IngestInvariantsPolicy{
+		ActiveSyncID:    syncID,
+		SyncType:        syncType,
+		FailFast:        c.failFastInvariants,
+		CompactionMerge: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("incremental expansion: ingest invariants: %w", err)
+	}
+	return verification, nil
+}
+
+// persistGraphSidecar writes the post-expansion graph into the compacted c1z
+// so the artifact carries its own base graph for the next incremental run.
+// Best-effort: on failure the next run just falls back to full expansion.
+func (c *Compactor) persistGraphSidecar(ctx context.Context, g *expand.EntitlementGraph, syncID string) {
+	gs, ok := c.compactedC1z.(sync.EntitlementGraphStore)
+	if !ok {
+		return
+	}
+	digestReader, ok := c.compactedC1z.(c1zstore.GrantGenerationDigestReader)
+	if !ok {
+		return
+	}
+	digest, found, err := digestReader.GrantGenerationDigest(ctx)
+	if err != nil || !found {
+		ctxzap.Extract(ctx).Warn("incremental expansion: sealed grant digest unavailable; graph will not be reusable", zap.Error(err))
+		return
+	}
+	data, err := expand.MarshalGraphBlobWithGrantDigest(syncID, g, digest)
+	if err == nil {
+		err = gs.PutEntitlementGraphBlob(ctx, data)
+	}
+	if err != nil {
+		ctxzap.Extract(ctx).Warn("incremental expansion: persist graph sidecar failed", zap.Error(err))
+	}
+}
+
+// restoreEndedSync returns the compacted sync to the ended state the full path
+// expects, after an incremental attempt that resumed it. Runs on a detached,
+// timeout-bounded context so a cancelled parent can't strand the store
+// mid-resume. Its failure is FATAL (errIncrementalFatal): the store is in an
+// unknown state and the full path must not run against it.
+func (c *Compactor) restoreEndedSync(ctx context.Context) error {
+	endCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dotc1z.FinalizeTimeout())
+	defer cancel()
+	if err := c.compactedC1z.EndSync(endCtx); err != nil {
+		return fmt.Errorf("%w: restore ended sync: %w", errIncrementalFatal, err)
+	}
+	return nil
+}
+
+// finishIncrementalExpansion ends, cleans up, and closes the store so the file
+// is flushed before cpFile copies it — converging with the other compaction
+// paths (Cleanup is a Pebble no-op today, kept for parity). Runs on a detached,
+// timeout-bounded context so a cancelled or run-duration-expired parent can't
+// abort finalization. All errors here are FATAL (errIncrementalFatal): the
+// store is being torn down, so falling back to full expansion against it is
+// not safe.
+func (c *Compactor) finishIncrementalExpansion(
+	ctx context.Context,
+	syncID string,
+	graph *expand.EntitlementGraph,
+	verification *c1zstore.IngestInvariantVerification,
+) (bool, error) {
+	finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dotc1z.FinalizeTimeout())
+	defer cancel()
+	if err := c.compactedC1z.Cleanup(finalizeCtx); err != nil {
+		return false, fmt.Errorf("%w: cleanup: %w", errIncrementalFatal, err)
+	}
+	if err := c.runIncrementalTestHook("before_end_sync"); err != nil {
+		return false, err
+	}
+	if err := c.compactedC1z.EndSync(finalizeCtx); err != nil {
+		return false, fmt.Errorf("%w: end sync: %w", errIncrementalFatal, err)
+	}
+	if err := c.runIncrementalTestHook("after_end_sync"); err != nil {
+		return false, err
+	}
+	c.persistGraphSidecar(finalizeCtx, graph, syncID)
+	if err := c.runIncrementalTestHook("after_sidecar"); err != nil {
+		return false, err
+	}
+	if verification != nil {
+		if writer, ok := c.compactedC1z.SyncMeta().(c1zstore.IngestInvariantVerificationWriter); ok {
+			if err := writer.MarkIngestInvariantsVerified(finalizeCtx, syncID, *verification); err != nil {
+				ctxzap.Extract(ctx).Warn("incremental expansion: persist invariant verification failed; artifact remains unverified", zap.Error(err))
+			}
+		}
+	}
+	if err := c.runIncrementalTestHook("after_marker"); err != nil {
+		return false, err
+	}
+	if err := c.runIncrementalTestHook("before_close"); err != nil {
+		return false, err
+	}
+	if err := c.compactedC1z.Close(finalizeCtx); err != nil {
+		return false, fmt.Errorf("%w: close: %w", errIncrementalFatal, err)
+	}
+	return true, nil
+}
+
+// changedEntitlementIDs returns the entitlement ids whose grants changed in
+// the applied increments, seeding the incremental walk. The fold collects
+// them during its merge (no re-read, no-ops excluded); rebuild-mode
+// compactions fall back to deriveChangedEntitlementIDs.
+func (c *Compactor) changedEntitlementIDs(ctx context.Context) ([]string, error) {
+	if c.foldChangedEntitlementIDs != nil {
+		out := make([]string, 0, len(c.foldChangedEntitlementIDs))
+		for id := range c.foldChangedEntitlementIDs {
+			out = append(out, id)
+		}
+		sort.Strings(out)
+		return out, nil
+	}
+	return c.deriveChangedEntitlementIDs(ctx)
+}
+
+// deriveChangedEntitlementIDs is the no-fold fallback: re-open each increment
+// (entries[1:]) and collect its grants' entitlement ids.
+func (c *Compactor) deriveChangedEntitlementIDs(ctx context.Context) ([]string, error) {
+	if len(c.entries) < 2 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	for _, e := range c.entries[1:] {
+		// Same open options as doOneCompaction: honor the caller's tmp dir
+		// (extraction must not silently land in os.TempDir()) and parallel decode.
+		store, err := dotc1z.NewStore(ctx, e.FilePath,
+			dotc1z.WithTmpDir(c.tmpDir),
+			dotc1z.WithDecoderOptions(dotc1z.WithDecoderConcurrency(-1)),
+			dotc1z.WithReadOnly(true),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("incremental expansion: open increment %s: %w", e.SyncID, err)
+		}
+		err = collectGrantEntitlementIDs(ctx, store, e.SyncID, seen)
+		if closeErr := store.Close(ctx); closeErr != nil && err == nil {
+			err = fmt.Errorf("incremental expansion: close increment %s: %w", e.SyncID, closeErr)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// collectGrantEntitlementIDs adds every entitlement id that has a grant in the
+// given sync to seen.
+func collectGrantEntitlementIDs(ctx context.Context, store c1zstore.Store, syncID string, seen map[string]struct{}) error {
+	if err := store.SetCurrentSync(ctx, syncID); err != nil {
+		return fmt.Errorf("incremental expansion: set increment sync %s: %w", syncID, err)
+	}
+	pageToken := ""
+	for {
+		resp, err := store.ListGrants(ctx, v2.GrantsServiceListGrantsRequest_builder{
+			PageSize:  1000,
+			PageToken: pageToken,
+		}.Build())
+		if err != nil {
+			return fmt.Errorf("incremental expansion: list increment grants for %s: %w", syncID, err)
+		}
+		for _, g := range resp.GetList() {
+			if id := g.GetEntitlement().GetId(); id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			return nil
+		}
+	}
+}
+
+// baseGraphEdge returns the base graph's edge src->dst and whether one exists.
+// Endpoints collapsed into one node (a fixed cycle) count as present with no
+// distinct edge (nil), which classifyEdgeSpecChange treats as unchanged.
+func baseGraphEdge(g *expand.EntitlementGraph, src, dst string) (*expand.Edge, bool) {
+	sn := g.GetNode(src)
+	dn := g.GetNode(dst)
+	if sn == nil || dn == nil {
+		return nil, false
+	}
+	if sn.Id == dn.Id {
+		return nil, true
+	}
+	dests, ok := g.SourcesToDestinations[sn.Id]
+	if !ok {
+		return nil, false
+	}
+	edgeID, ok := dests[dn.Id]
+	if !ok {
+		return nil, false
+	}
+	e, ok := g.Edges[edgeID]
+	if !ok {
+		return nil, false
+	}
+	return &e, true
+}
+
+// mergeCurrentEdgeSpecs folds parallel connector rules for the same endpoints
+// into the one effective graph edge AddEdge would build: deep wins over
+// shallow, an unfiltered rule wins over filtered rules, and otherwise filters
+// are unioned.
+func mergeCurrentEdgeSpecs(left, right expand.NewEdge) expand.NewEdge {
+	out := left
+	out.Shallow = left.Shallow && right.Shallow
+	if len(left.ResourceTypeIDs) == 0 || len(right.ResourceTypeIDs) == 0 {
+		out.ResourceTypeIDs = nil
+		return out
+	}
+
+	resourceTypeIDs := make(map[string]struct{}, len(left.ResourceTypeIDs)+len(right.ResourceTypeIDs))
+	for _, id := range left.ResourceTypeIDs {
+		resourceTypeIDs[id] = struct{}{}
+	}
+	for _, id := range right.ResourceTypeIDs {
+		resourceTypeIDs[id] = struct{}{}
+	}
+	out.ResourceTypeIDs = make([]string, 0, len(resourceTypeIDs))
+	for id := range resourceTypeIDs {
+		out.ResourceTypeIDs = append(out.ResourceTypeIDs, id)
+	}
+	sort.Strings(out.ResourceTypeIDs)
+	return out
+}
+
+type edgeSpecChange int
+
+const (
+	edgeSpecUnchanged edgeSpecChange = iota
+	edgeSpecWidened
+	edgeSpecNarrowed
+)
+
+// classifyEdgeSpecChange compares an existing base edge's spec to the current
+// (increment) spec. Narrowing (deep->shallow, filter tightened) is
+// revocation-shaped; widening (shallow->deep, filter broadened) needs
+// re-expansion. Any narrowing wins (safest: decline to full).
+func classifyEdgeSpecChange(base *expand.Edge, cur expand.NewEdge) edgeSpecChange {
+	if base == nil {
+		return edgeSpecUnchanged // collapsed cycle: no distinct edge
+	}
+	widened, narrowed := false, false
+	if base.IsShallow && !cur.Shallow {
+		widened = true // shallow -> deep
+	}
+	if !base.IsShallow && cur.Shallow {
+		narrowed = true // deep -> shallow
+	}
+	rw, rn := compareResourceTypeFilter(base.ResourceTypeIDs, cur.ResourceTypeIDs)
+	widened = widened || rw
+	narrowed = narrowed || rn
+	switch {
+	case narrowed:
+		return edgeSpecNarrowed
+	case widened:
+		return edgeSpecWidened
+	default:
+		return edgeSpecUnchanged
+	}
+}
+
+// compareResourceTypeFilter compares two principal-type filters where an empty
+// filter means "all types" (the widest). Returns whether the current filter is
+// wider and/or narrower than the base.
+func compareResourceTypeFilter(base, cur []string) (bool, bool) {
+	var widened, narrowed bool
+	baseAll := len(base) == 0
+	curAll := len(cur) == 0
+	switch {
+	case baseAll && curAll:
+		return false, false
+	case baseAll && !curAll:
+		return false, true // all -> some
+	case !baseAll && curAll:
+		return true, false // some -> all
+	}
+	baseSet := make(map[string]struct{}, len(base))
+	for _, t := range base {
+		baseSet[t] = struct{}{}
+	}
+	curSet := make(map[string]struct{}, len(cur))
+	for _, t := range cur {
+		curSet[t] = struct{}{}
+	}
+	for t := range curSet {
+		if _, ok := baseSet[t]; !ok {
+			widened = true
+		}
+	}
+	for t := range baseSet {
+		if _, ok := curSet[t]; !ok {
+			narrowed = true
+		}
+	}
+	return widened, narrowed
+}
+
 func (c *Compactor) expandGrants(ctx context.Context, newSyncId string, compactionStart time.Time) error {
 	l := ctxzap.Extract(ctx)
+
+	// Diff-aware fast path: with a base graph, expand only what changed relative
+	// to it. Any doubt (cycle, error) falls through to full expansion below.
+	// Pebble-only: it reopens the ended compacted sync to write grants, which
+	// only Pebble supports; on other engines we degrade gracefully to full.
+	switch {
+	case !c.incrementalExpansion:
+		logIncrementalOutcome(ctx, "not_attempted", "not_requested")
+	case c.resolvedEngine() != c1zstore.EnginePebble:
+		logIncrementalOutcome(ctx, "not_attempted", "unsupported_engine",
+			zap.String("engine", string(c.resolvedEngine())))
+	default:
+		baseGraph, loadErr := c.loadIncrementalBaseGraph(ctx)
+		if loadErr != nil {
+			logIncrementalOutcome(ctx, "fell_back", "base_graph_error", zap.Error(loadErr))
+			break
+		}
+		if baseGraph == nil {
+			logIncrementalOutcome(ctx, "fell_back", "base_graph_missing_or_stale")
+			break
+		}
+		c.incrementalBaseGraph = baseGraph
+		done, err := c.expandGrantsIncremental(ctx, newSyncId, compactionStart)
+		switch {
+		case errors.Is(err, errIncrementalFatal):
+			// The store's finalization (or restore-to-ended) failed: it is in an
+			// unknown/torn-down state, so running full expansion against it is
+			// unsafe. Fail the compaction.
+			logIncrementalOutcome(ctx, "failed", "finalization_error", zap.Error(err))
+			return fmt.Errorf("incremental grant expansion: %w", err)
+		case errors.Is(err, errIncrementalDroppedEdgeDecline):
+			logIncrementalOutcome(ctx, "declined", "dropped_edge")
+		case errors.Is(err, expand.ErrIncrementalRevocationDecline):
+			// Named revocation hook (#6): today declines to full; a future
+			// tombstone stage flips this one site to apply deletions.
+			logIncrementalOutcome(ctx, "declined", "revocation")
+		case errors.Is(err, expand.ErrIncrementalDenseChangeDecline):
+			logIncrementalOutcome(ctx, "declined", "dense_change")
+		case errors.Is(err, expand.ErrIncrementalFallback):
+			// New edge closed a cycle: full expansion handles cycles correctly.
+			logIncrementalOutcome(ctx, "declined", "cycle")
+		case err != nil:
+			// Pre-write or restored-state failure: the store is back in the
+			// ended state the full path expects, so falling back is safe.
+			logIncrementalOutcome(ctx, "fell_back", "incremental_error", zap.Error(err))
+		case done:
+			// Incremental path already ended + closed the store; caller clears
+			// c.compactedC1z after return, same as the full path.
+			c.incrementalExpansionRan = true
+			logIncrementalOutcome(ctx, "succeeded", "none")
+			return nil
+		}
+	}
+
 	// Grant expansion doesn't use the connector interface at all, so giving syncer an empty connector is safe... for now.
 	// If that ever changes, we should implement a file connector that is a wrapper around the reader.
 	emptyConnector, err := sdk.NewEmptyConnector()
@@ -429,6 +1311,28 @@ func (c *Compactor) expandGrants(ctx context.Context, newSyncId string, compacti
 		sync.WithTmpDir(c.tmpDir),
 		sync.WithSyncID(newSyncId),
 		sync.WithOnlyExpandGrants(),
+		// The store is a keep-newer merge: invariant verdicts must
+		// attribute merge-manufactured shapes to the merge, not the
+		// connector, and must not fail the seal over them. Wiring
+		// pinned by TestCompactionExpandToleratesMergeManufacturedExclusionConflicts.
+		sync.WithCompactionMergedStore(),
+	}
+	if c.failFastInvariants {
+		syncOpts = append(syncOpts, sync.WithFailFastInvariants())
+	}
+
+	// Keep the artifact's graph sidecar coherent with this full expansion:
+	// opted-in compactions preserve a fresh graph (so the incremental chain
+	// heals after a fallback); otherwise drop any sidecar inherited from a
+	// fold-copied base. Pebble-only: incremental expansion declines on other
+	// engines, and without a sidecar a preserved graph has nowhere to go:
+	// no writer puts a graph in a sync token.
+	if c.incrementalExpansion && c.resolvedEngine() == c1zstore.EnginePebble {
+		syncOpts = append(syncOpts, sync.WithPreserveEntitlementGraph())
+	} else if gs, ok := c.compactedC1z.(sync.EntitlementGraphStore); ok {
+		if err := gs.DeleteEntitlementGraphBlob(ctx); err != nil {
+			l.Warn("expandGrants: delete inherited graph sidecar failed", zap.Error(err))
+		}
 	}
 
 	compactionDuration := time.Since(compactionStart)
@@ -456,9 +1360,74 @@ func (c *Compactor) expandGrants(ctx context.Context, newSyncId string, compacti
 		l.Error("error syncing with grant expansion", zap.Error(err))
 		return err
 	}
+	if c.resolvedEngine() == c1zstore.EnginePebble && c.pebbleMode != PebbleCompactorModeFold {
+		eng, ok := enginepkg.AsEngine(c.compactedC1z)
+		if !ok {
+			err := errors.New("invalidate expanded compaction source-cache state: compacted store is not a pebble engine")
+			return errors.Join(err, syncer.Close(ctx))
+		}
+		if err := eng.InvalidateSourceCacheReplayState(ctx, true); err != nil {
+			err = fmt.Errorf("invalidate expanded compaction source-cache state: %w", err)
+			return errors.Join(err, syncer.Close(ctx))
+		}
+		if !enginepkg.MarkStoreDirty(c.compactedC1z) {
+			err := errors.New("invalidate expanded compaction source-cache state: could not mark store dirty")
+			return errors.Join(err, syncer.Close(ctx))
+		}
+	}
 	if err := syncer.Close(ctx); err != nil {
 		l.Error("error closing syncer", zap.Error(err))
 		return err
 	}
 	return nil
+}
+
+func logIncrementalOutcome(ctx context.Context, outcome, reason string, fields ...zap.Field) {
+	fields = append([]zap.Field{
+		zap.String("incremental_expansion_outcome", outcome),
+		zap.String("incremental_expansion_reason", reason),
+	}, fields...)
+	ctxzap.Extract(ctx).Info("incremental grant expansion outcome", fields...)
+}
+
+func (c *Compactor) loadIncrementalBaseGraph(ctx context.Context) (*expand.EntitlementGraph, error) {
+	if len(c.entries) == 0 || c.entries[0] == nil || c.entries[0].SyncID == "" {
+		return nil, fmt.Errorf("incremental expansion: compaction base is missing")
+	}
+	store, err := dotc1z.NewStore(ctx, c.entries[0].FilePath,
+		dotc1z.WithReadOnly(true), dotc1z.WithTmpDir(c.tmpDir))
+	if err != nil {
+		return nil, fmt.Errorf("incremental expansion: open base graph store: %w", err)
+	}
+	run, runErr := store.SyncMeta().LatestFinishedSyncOfAnyType(ctx)
+	if runErr != nil {
+		_ = store.Close(ctx)
+		return nil, fmt.Errorf("incremental expansion: load base verification: %w", runErr)
+	}
+	// Both engines return (nil, nil) when the artifact holds no finished sync
+	// (e.g. an interrupted collection): decline to full expansion, don't panic.
+	if run == nil {
+		_ = store.Close(ctx)
+		return nil, fmt.Errorf("incremental expansion: base has no finished sync")
+	}
+	if run.ID != c.entries[0].SyncID ||
+		!run.IsVerified() ||
+		run.Generation != sync.IngestInvariantGeneration {
+		_ = store.Close(ctx)
+		return nil, fmt.Errorf("incremental expansion: base grant generation is not verified")
+	}
+	graph, graphErr := sync.GraphFromStore(ctx, store, c.entries[0].SyncID)
+	closeErr := store.Close(ctx)
+	if graphErr != nil {
+		return nil, fmt.Errorf("incremental expansion: load base graph: %w", graphErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("incremental expansion: close base graph store: %w", closeErr)
+	}
+	if graph != nil {
+		if err := graph.ValidateCompleted(); err != nil {
+			return nil, fmt.Errorf("incremental expansion: invalid base graph: %w", err)
+		}
+	}
+	return graph, nil
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/doug-martin/goqu/v9"
@@ -31,6 +32,7 @@ import (
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
@@ -48,7 +50,7 @@ type C1File struct {
 	viewSyncID         string
 	outputFilePath     string
 	dbFilePath         string
-	dbUpdated          bool
+	dbUpdated          atomic.Bool
 	tempDir            string
 	pragmas            []pragma
 	readOnly           bool
@@ -73,7 +75,7 @@ type C1File struct {
 	deferredIndexTables []tableDescriptor
 
 	// Cached sync run for listConnectorObjects (avoids N+1 queries)
-	cachedViewSyncRun *SyncRun
+	cachedViewSyncRun *c1zstore.SyncRun
 	cachedViewSyncMu  sync.Mutex
 	cachedViewSyncErr error
 
@@ -94,21 +96,22 @@ type C1File struct {
 	// engine is the storage engine to use for newly created files.
 	// Reads dispatch on magic byte regardless of this value. Default
 	// is EngineSQLite (v1 .c1z format).
-	engine Engine
+	engine c1zstore.Engine
 
 	// payloadEncoding selects the v3 envelope payload framing for
 	// Pebble-written files. Zero value = PayloadEncodingTarZstd
 	// (default). Ignored by the SQLite engine.
-	payloadEncoding PayloadEncoding
+	payloadEncoding c1zstore.PayloadEncoding
 }
 
 // *C1File satisfies connectorstore.Writer (the connector-facing contract),
 // connectorstore.LatestFinishedSyncIDFetcher (narrow optional capability
-// added in PR #774), and dotc1z.C1ZStore (the internal sync-pipeline
+// added in PR #774), and c1zstore.Store (the internal sync-pipeline
 // contract asserted in c1file_store.go alongside the sub-store assertions).
 var (
 	_ connectorstore.Writer                      = (*C1File)(nil)
 	_ connectorstore.LatestFinishedSyncIDFetcher = (*C1File)(nil)
+	_ c1zstore.Store                             = (*C1File)(nil)
 )
 
 type C1FOption func(*C1File)
@@ -209,7 +212,7 @@ func WithC1FSyncCountLimit(limit int) C1FOption {
 // Engine selection only affects newly created files. Existing files
 // dispatch on their magic byte; readers handle both v1 and v3
 // regardless of this option.
-func WithC1FEngine(engine Engine) C1FOption {
+func WithC1FEngine(engine c1zstore.Engine) C1FOption {
 	return func(o *C1File) {
 		o.engine = engine
 	}
@@ -217,7 +220,7 @@ func WithC1FEngine(engine Engine) C1FOption {
 
 // WithC1FPayloadEncoding selects the v3 envelope payload encoding
 // (TAR_ZSTD default, TAR uncompressed). No-op for SQLite engines.
-func WithC1FPayloadEncoding(enc PayloadEncoding) C1FOption {
+func WithC1FPayloadEncoding(enc c1zstore.PayloadEncoding) C1FOption {
 	return func(o *C1File) {
 		o.payloadEncoding = enc
 	}
@@ -242,12 +245,16 @@ func WithC1FV2GrantsWriter(enabled bool) C1FOption {
 }
 
 // Returns a C1File instance for the given db filepath.
+//
+// The raw DB handle is closed on every init failure; caller-supplied raw
+// paths are never deleted on failure (NewC1ZFile's cleanupDbDir still
+// removes the SDK's own decoded temp dir).
 func NewC1File(ctx context.Context, dbFilePath string, opts ...C1FOption) (*C1File, error) {
 	ctx, span := tracer.Start(ctx, "NewC1File")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
-	rawDB, err := sql.Open("sqlite", dbFilePath)
+	rawDB, err := openSQLite(ctx, dbFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("new-c1-file: error opening raw db: %w", err)
 	}
@@ -292,7 +299,7 @@ func NewC1File(ctx context.Context, dbFilePath string, opts ...C1FOption) (*C1Fi
 	// engine manages its own storage and does not use those indexes, so bulk
 	// load does not apply there. Make the combination an explicit, logged
 	// no-op rather than leaving it silently unspecified.
-	if c1File.bulkLoad && c1File.engine == EnginePebble {
+	if c1File.bulkLoad && c1File.engine == c1zstore.EnginePebble {
 		l.Info("new-c1-file: bulk load ignored for the pebble engine; the deferred-index optimization applies only to the sqlite engine")
 		c1File.bulkLoad = false
 	}
@@ -310,17 +317,25 @@ func NewC1File(ctx context.Context, dbFilePath string, opts ...C1FOption) (*C1Fi
 	// Normalize the engine zero value so downstream switch/if-eq
 	// checks treat an unset engine as EngineSQLite.
 	if c1File.engine == "" {
-		c1File.engine = EngineSQLite
+		c1File.engine = c1zstore.EngineSQLite
+	}
+
+	// A rejected file must not leak its handle.
+	initFailed := func(primary error) error {
+		if closeErr := c1File.closeRawDB(ctx); closeErr != nil {
+			return errors.Join(primary, fmt.Errorf("new-c1-file: error closing raw db after failed init: %w", closeErr))
+		}
+		return primary
 	}
 
 	err = c1File.validateDb(ctx)
 	if err != nil {
-		return nil, err
+		return nil, initFailed(err)
 	}
 
 	err = c1File.init(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("new-c1-file: error initializing c1file: %w", err)
+		return nil, initFailed(fmt.Errorf("new-c1-file: error initializing c1file: %w", err))
 	}
 
 	return c1File, nil
@@ -338,15 +353,27 @@ type c1zOptions struct {
 	v2GrantsWriter     bool
 	bulkLoad           bool
 
+	// disableGrantDigestIndex turns off the Pebble engine's seal-time
+	// build of the by_entitlement_principal_hash index + grant digests.
+	// Inverted so the zero value keeps the build on (current behavior).
+	// See WithGrantDigestIndex.
+	disableGrantDigestIndex bool
+
 	// engine is the storage engine to use for newly created files.
-	// Reads dispatch on magic byte regardless. Default EngineSQLite.
-	engine Engine
+	// Reads dispatch on magic byte regardless. NewStore defaults an
+	// unset engine to EnginePebble; NewC1ZFile (SQLite-only) normalizes
+	// unset to EngineSQLite.
+	engine c1zstore.Engine
 
 	// payloadEncoding controls the v3 envelope payload framing. Only
 	// honored when engine == EnginePebble (the v3 path). Allowed
 	// values: PayloadEncodingTarZstd (default), PayloadEncodingTar.
 	// Zero value means PayloadEncodingTarZstd.
-	payloadEncoding PayloadEncoding
+	payloadEncoding c1zstore.PayloadEncoding
+
+	// decoderPool optionally scopes v3 payload-decoder reuse to the
+	// caller's operation. See WithDecoderPool.
+	decoderPool *EnvelopeDecoderPool
 }
 
 type C1ZOption func(*c1zOptions)
@@ -420,12 +447,14 @@ func WithSyncLimit(limit int) C1ZOption {
 }
 
 // WithEngine selects the storage engine for newly created .c1z files.
-// Default is EngineSQLite (v1 format). EnginePebble enables the v3
-// engine.
+// Under NewStore the default is EnginePebble (v3 format); EngineSQLite
+// selects the legacy v1 engine. NewC1ZFile does not share that default:
+// it is the SQLite-only constructor, treats an unset engine as
+// EngineSQLite, and rejects a writable EnginePebble request.
 //
 // Reading existing files dispatches on the file's magic byte and is
 // independent of this option.
-func WithEngine(engine Engine) C1ZOption {
+func WithEngine(engine c1zstore.Engine) C1ZOption {
 	return func(o *c1zOptions) {
 		o.engine = engine
 	}
@@ -436,6 +465,21 @@ func WithEngine(engine Engine) C1ZOption {
 func WithV2GrantsWriter(enabled bool) C1ZOption {
 	return func(o *c1zOptions) {
 		o.v2GrantsWriter = enabled
+	}
+}
+
+// WithGrantDigestIndex toggles the Pebble engine's seal-time build of
+// the by_entitlement_principal_hash index and per-entitlement grant
+// digests (the substrate for cross-file grant diffing). Default true.
+//
+// Pass false for files that will never be grant-diffed (local CLI syncs,
+// connector development) to skip the seal-time derivation pass. Safe to
+// toggle: a file sealed with this off stores no digest roots, which
+// readers treat as "missing — recalculate", never as "no grants". No
+// effect on the SQLite engine.
+func WithGrantDigestIndex(enabled bool) C1ZOption {
+	return func(o *c1zOptions) {
+		o.disableGrantDigestIndex = !enabled
 	}
 }
 
@@ -460,13 +504,22 @@ func WithBulkLoad(enabled bool) C1ZOption {
 //
 // No-op for SQLite engines; the encoding selector applies only to
 // the v3 envelope written by Pebble.
-func WithPayloadEncoding(enc PayloadEncoding) C1ZOption {
+func WithPayloadEncoding(enc c1zstore.PayloadEncoding) C1ZOption {
 	return func(o *c1zOptions) {
 		o.payloadEncoding = enc
 	}
 }
 
-// Returns a new C1File instance with its state stored at the provided filename.
+// NewC1ZFile returns a new C1File instance with its state stored at the
+// provided filename.
+//
+// Deprecated: NewC1ZFile is the SQLite-only constructor; it always returns a
+// *C1File backed by the v1/SQLite engine and errors if the Pebble engine is
+// requested for a writable file. Prefer [NewStore], which supports multiple
+// database engines — it selects the engine appropriate for outputFilePath
+// (SQLite or Pebble) and returns the engine-neutral [C1ZStore] interface.
+// NewC1ZFile remains only for callers that need SQLite-specific *C1File
+// methods (e.g. ToPebble, RollbackExpansion) that are not part of C1ZStore.
 func NewC1ZFile(ctx context.Context, outputFilePath string, opts ...C1ZOption) (*C1File, error) {
 	ctx, span := tracer.Start(ctx, "NewC1ZFile")
 	var err error
@@ -476,9 +529,15 @@ func NewC1ZFile(ctx context.Context, outputFilePath string, opts ...C1ZOption) (
 	if err != nil {
 		return nil, err
 	}
+	// Ensure c1z decompression honors caller cancellation. Prepended so an
+	// explicit WithDecoderOptions(WithContext(...)) from the caller still wins.
+	options.decoderOptions = append([]DecoderOption{WithContext(ctx)}, options.decoderOptions...)
 
-	if options.engine == EnginePebble && !options.readOnly {
-		err = fmt.Errorf("new-c1z-file: %s is a v1/sqlite c1z and engine %q was requested; NewC1ZFile cannot return a *C1File for it — open with NewStore to convert", outputFilePath, EnginePebble)
+	if options.engine == c1zstore.EnginePebble && !options.readOnly {
+		err = fmt.Errorf(
+			"new-c1z-file: %s is a v1/sqlite c1z and engine %q was requested; "+
+				"NewC1ZFile cannot return a *C1File for it — open with NewStore to convert",
+			outputFilePath, c1zstore.EnginePebble)
 		return nil, err
 	}
 
@@ -521,7 +580,7 @@ func NewC1ZFile(ctx context.Context, outputFilePath string, opts ...C1ZOption) (
 	if options.engine != "" {
 		c1fopts = append(c1fopts, WithC1FEngine(options.engine))
 	}
-	if options.payloadEncoding != PayloadEncodingUnspecified {
+	if options.payloadEncoding != c1zstore.PayloadEncodingUnspecified {
 		c1fopts = append(c1fopts, WithC1FPayloadEncoding(options.payloadEncoding))
 	}
 
@@ -537,7 +596,7 @@ func NewC1ZFile(ctx context.Context, outputFilePath string, opts ...C1ZOption) (
 
 func cleanupDbDir(dbFilePath string, err error) error {
 	// Stat dbFilePath to make sure it's a file, not a directory.
-	stat, statErr := os.Stat(dbFilePath)
+	stat, statErr := os.Stat(dbFilePath) // #nosec G703 -- c1z db path is caller-controlled by API design.
 	if statErr != nil {
 		if errors.Is(statErr, os.ErrNotExist) {
 			// If the file doesn't exist, we can't clean up the directory.
@@ -550,7 +609,7 @@ func cleanupDbDir(dbFilePath string, err error) error {
 		return errors.Join(err, fmt.Errorf("cleanupDbDir: dbFilePath %s is a directory, not a file: %w", dbFilePath, statErr))
 	}
 
-	cleanupErr := os.RemoveAll(filepath.Dir(dbFilePath))
+	cleanupErr := os.RemoveAll(filepath.Dir(dbFilePath)) // #nosec G703 -- removing temp db directory derived from caller-controlled c1z path.
 	if cleanupErr != nil {
 		err = errors.Join(err, cleanupErr)
 	}
@@ -568,8 +627,6 @@ var ErrReadOnly = errors.New("c1z: read only mode")
 // cannot truncate the c1z mid-finalize; the new-root finalize span links
 // back to the caller's trace for navigability without bloating the
 // parent trace.
-//
-//nolint:nonamedreturns // named return required so the deferred span captures all early-return error paths
 func (c *C1File) Close(ctx context.Context) (retErr error) {
 	ctx, span := tracer.Start(ctx, "C1File.Close")
 	defer func() { uotel.EndSpanWithError(span, retErr) }()
@@ -585,7 +642,7 @@ func (c *C1File) Close(ctx context.Context) (retErr error) {
 
 	span.SetAttributes(
 		attribute.Bool("read_only", c.readOnly),
-		attribute.Bool("db_updated", c.dbUpdated),
+		attribute.Bool("db_updated", c.dbUpdated.Load()),
 		attribute.String("db_path", c.dbFilePath),
 	)
 
@@ -596,13 +653,13 @@ func (c *C1File) Close(ctx context.Context) (retErr error) {
 	// open) before returning so a misuse like opening read-only and
 	// then dirtying via an attached-db mutation still releases the
 	// SQLite handle and any FDs/goroutines it owns.
-	if !c.dbUpdated || c.readOnly {
+	if !c.dbUpdated.Load() || c.readOnly {
 		if c.rawDb != nil {
 			if err := c.closeRawDB(ctx); err != nil {
 				return cleanupDbDir(c.dbFilePath, err)
 			}
 		}
-		if c.dbUpdated && c.readOnly {
+		if c.dbUpdated.Load() && c.readOnly {
 			c.closed = true
 			return cleanupDbDir(c.dbFilePath, ErrReadOnly)
 		}
@@ -629,7 +686,10 @@ func (c *C1File) Close(ctx context.Context) (retErr error) {
 	// state stays consistent for a retried Close.
 	if c.bulkLoad {
 		if err := c.buildDeferredIndexes(ctx); err != nil {
-			return err
+			// Storage verdict: mutations exist but the c1z was not
+			// rewritten (the working DB is preserved for a retried Close,
+			// per the comment above).
+			return artifactUnusable(err)
 		}
 	}
 
@@ -678,6 +738,13 @@ func (c *C1File) finalize(ctx context.Context) error {
 
 	l := ctxzap.Extract(finalizeCtx)
 
+	// Every error return from here through saveC1z carries the
+	// ErrArtifactUnusable storage verdict: mutations exist but the output
+	// c1z was not rewritten, so the on-disk artifact is stale relative to
+	// this run's progress (saveC1z's atomic temp+rename means it is never
+	// torn). Post-save failures (cleanup, below) deliberately do not carry
+	// the verdict — the artifact is a faithful commit at that point.
+	//
 	// Only WAL-checkpoint and close the raw DB if a handle is open.
 	// Some callers (notably TestC1ZDecoder) manually close c.rawDb to
 	// force a checkpoint before calling Close — that path skips both
@@ -692,7 +759,7 @@ func (c *C1File) finalize(ctx context.Context) error {
 		// then truncates the WAL file to zero bytes.
 		busy, log, checkpointed, err := c.truncateWAL(finalizeCtx)
 		if err != nil {
-			finalizeErr = fmt.Errorf("c1z: WAL checkpoint failed: %w", err)
+			finalizeErr = artifactUnusable(fmt.Errorf("c1z: WAL checkpoint failed: %w", err))
 			l.Error("WAL checkpoint failed before close",
 				zap.Error(err),
 				zap.String("db_path", c.dbFilePath))
@@ -702,7 +769,7 @@ func (c *C1File) finalize(ctx context.Context) error {
 			return cleanupDbDir(c.dbFilePath, finalizeErr)
 		}
 		if busy != 0 || (log >= 0 && checkpointed < log) {
-			finalizeErr = fmt.Errorf("c1z: WAL checkpoint incomplete: busy=%d log=%d checkpointed=%d", busy, log, checkpointed)
+			finalizeErr = artifactUnusable(fmt.Errorf("c1z: WAL checkpoint incomplete: busy=%d log=%d checkpointed=%d", busy, log, checkpointed))
 			l.Error("WAL checkpoint incomplete before close",
 				zap.Int("busy", busy),
 				zap.Int("log", log),
@@ -715,8 +782,8 @@ func (c *C1File) finalize(ctx context.Context) error {
 		}
 
 		if err := c.closeRawDB(finalizeCtx); err != nil {
-			finalizeErr = err
-			return cleanupDbDir(c.dbFilePath, err)
+			finalizeErr = artifactUnusable(err)
+			return cleanupDbDir(c.dbFilePath, finalizeErr)
 		}
 	}
 
@@ -725,7 +792,7 @@ func (c *C1File) finalize(ctx context.Context) error {
 	// the main database file.
 	walPath := c.dbFilePath + "-wal"
 	if walInfo, statErr := os.Stat(walPath); statErr == nil && walInfo.Size() > 0 {
-		finalizeErr = fmt.Errorf("c1z: WAL file not empty after close (size=%d) - refusing to save incomplete data", walInfo.Size())
+		finalizeErr = artifactUnusable(fmt.Errorf("c1z: WAL file not empty after close (size=%d) - refusing to save incomplete data", walInfo.Size()))
 		return cleanupDbDir(c.dbFilePath, finalizeErr)
 	}
 
@@ -743,14 +810,17 @@ func (c *C1File) finalize(ctx context.Context) error {
 	saveErr := saveC1z(c.dbFilePath, c.outputFilePath, c.encoderConcurrency)
 	uotel.EndSpanWithError(saveSpan, saveErr)
 	if saveErr != nil {
-		finalizeErr = saveErr
-		return cleanupDbDir(c.dbFilePath, saveErr)
+		finalizeErr = artifactUnusable(saveErr)
+		return cleanupDbDir(c.dbFilePath, finalizeErr)
 	}
 	if outInfo, statErr := os.Stat(c.outputFilePath); statErr == nil {
 		finalizeSpan.SetAttributes(attribute.Int64("c1z.finalize.output_bytes", outInfo.Size()))
 		recordC1ZSize(finalizeCtx, "finalize", outInfo.Size())
 	}
 
+	// No artifactUnusable here: the save above succeeded, so the c1z on
+	// disk is a faithful commit; a cleanup failure must not become a
+	// discard verdict.
 	if err := cleanupDbDir(c.dbFilePath, nil); err != nil {
 		finalizeErr = err
 		return err
@@ -766,8 +836,13 @@ func (c *C1File) closeRawDB(ctx context.Context) error {
 	_, span := tracer.Start(ctx, "C1File.closeRawDB")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
-	err = c.rawDb.Close()
+	if c.rawDb == nil {
+		return nil
+	}
+	// Copy the rawDb to a local variable to avoid race conditions.
+	rawDb := c.rawDb
 	c.rawDb = nil
+	err = rawDb.Close()
 	c.db = nil
 	return err
 }
@@ -931,6 +1006,14 @@ func (c *C1File) InitTables(ctx context.Context) (bool, error) {
 
 	l := ctxzap.Extract(ctx).With(zap.String("db_file_path", c.dbFilePath))
 
+	// Metadata-only schema guard: reject hostile/unsupported executable
+	// schema (triggers, views, virtual/generated-column SDK tables) BEFORE
+	// any DDL/DML — the first Schema() exec, the migrations, and every
+	// later statement must never run against file-authored SQL objects.
+	if err := validateSQLiteSchema(ctx, c.rawDb, "main"); err != nil {
+		return false, fmt.Errorf("c1file-init-tables: %w", err)
+	}
+
 	// Get schema version before creating tables/indexes/running migrations.
 	schemaVersion, err := getSchemaVersion(ctx, c.db)
 	if err != nil {
@@ -1004,8 +1087,9 @@ func (c *C1File) InitTables(ctx context.Context) (bool, error) {
 					zap.String("table_name", t.Name()))
 			} else {
 				for _, idxName := range deferrable {
-					// Identifier comes from our own DDL; quote it for hygiene.
-					if _, derr := c.db.ExecContext(ctx, fmt.Sprintf(`DROP INDEX IF EXISTS "%s"`, idxName)); derr != nil {
+					// idxName comes from the opened file's own schema
+					// (PRAGMA index_list), so it is untrusted.
+					if _, derr := c.db.ExecContext(ctx, fmt.Sprintf(`DROP INDEX IF EXISTS %s`, quoteIdentifier(idxName))); derr != nil {
 						return false, fmt.Errorf("c1file-init-tables: error deferring index %s on %s: %w", idxName, t.Name(), derr)
 					}
 				}
@@ -1131,6 +1215,7 @@ func statsToMap(stats *reader_v2.SyncStats, syncType connectorstore.SyncType) ma
 	for rt, n := range stats.GetResourcesByResourceType() {
 		out[rt] = n
 	}
+
 	return out
 }
 
@@ -1144,43 +1229,82 @@ func (c *C1File) Stats(ctx context.Context, syncType connectorstore.SyncType, sy
 	return statsToMap(stats, connectorstore.SyncType(sync.GetSyncType())), nil
 }
 
+// RecalculateStats recomputes the cached stats for the given sync from the
+// underlying tables and persists them, discarding any previously cached
+// value. The store must be writable (stats are only persisted for ended
+// syncs on a non-read-only c1z).
+func (c *C1File) RecalculateStats(ctx context.Context, syncId string) error {
+	if c.readOnly {
+		return ErrReadOnly
+	}
+	_, _, err := c.stats(ctx, connectorstore.SyncTypeAny, syncId, true)
+	return err
+}
+
+func (c *C1File) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncId string) (*reader_v2.SyncStats, error) {
+	ctx, span := tracer.Start(ctx, "C1File.StatsV2")
+	var err error
+	defer func() { uotel.EndSpanWithError(span, err) }()
+
+	_, stats, err := c.stats(ctx, syncType, syncId, false)
+	return stats, err
+}
+
 func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, syncId string, forceRefresh bool) (*reader_v2.SyncRun, *reader_v2.SyncStats, error) {
 	ctx, span := tracer.Start(ctx, "C1File.Stats")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
 
 	if syncId == "" {
+		// Empty syncID resolves to the latest finished sync of the
+		// requested type — never an in-progress current sync.
 		syncId, err = c.LatestSyncID(ctx, syncType)
 		if err != nil {
 			return nil, nil, err
 		}
+		if syncId == "" {
+			if syncType == connectorstore.SyncTypeAny || syncType == "" {
+				return nil, nil, status.Error(codes.NotFound, "no finished sync found")
+			}
+			return nil, nil, status.Errorf(codes.NotFound, "no finished sync of type '%s' found", syncType)
+		}
 	}
-	resp, err := c.GetSync(ctx, reader_v2.SyncsReaderServiceGetSyncRequest_builder{SyncId: syncId}.Build())
+
+	sync, err := c.getSync(ctx, syncId)
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp == nil || !resp.HasSync() {
+	if sync == nil {
 		return nil, nil, status.Errorf(codes.NotFound, "sync '%s' not found", syncId)
 	}
-	sync := resp.GetSync()
-	if syncType != connectorstore.SyncTypeAny && syncType != connectorstore.SyncType(sync.GetSyncType()) {
+	if syncType != connectorstore.SyncTypeAny && syncType != sync.Type {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "sync '%s' is not of type '%s'", syncId, syncType)
 	}
-	syncType = connectorstore.SyncType(sync.GetSyncType())
+	syncType = sync.Type
 
-	stats := sync.GetStats()
+	stats := sync.Stats
 	if stats != nil && stats.GetResourceTypes() > 0 && !forceRefresh {
-		return sync, stats, nil
+		return &reader_v2.SyncRun{
+			Id:           sync.ID,
+			StartedAt:    toTimeStamp(sync.StartedAt),
+			EndedAt:      toTimeStamp(sync.EndedAt),
+			SyncToken:    sync.SyncToken,
+			SyncType:     string(sync.Type),
+			ParentSyncId: sync.ParentSyncID,
+			Stats:        sync.Stats,
+		}, stats, nil
 	}
 
 	// Slow path: Calculate sync stats and save them to the sync run so subsequent stats calls
 	stats = &reader_v2.SyncStats{
-		ResourceTypes:           0,
-		Resources:               0,
-		Entitlements:            0,
-		Grants:                  0,
-		ResourcesByResourceType: make(map[string]int64),
-		GrantsByResourceType:    make(map[string]int64),
+		ResourceTypes:              0,
+		Resources:                  0,
+		Entitlements:               0,
+		Grants:                     0,
+		Assets:                     0,
+		ResourcesByResourceType:    make(map[string]int64),
+		GrantsByResourceType:       make(map[string]int64),
+		EntitlementsByResourceType: make(map[string]int64),
 	}
 
 	var rtStats []*v2.ResourceType
@@ -1227,13 +1351,15 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 	}
 
 	if syncType != connectorstore.SyncTypeResourcesOnly {
-		entitlementsCount, err := c.db.From(entitlements.Name()).
-			Where(goqu.C("sync_id").Eq(syncId)).
-			CountContext(ctx)
+		entitlementCounts, err := c.countBySyncAndResourceType(ctx, entitlements.Name(), syncId)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("count entitlements: %w", err)
 		}
-		stats.Entitlements = entitlementsCount
+		stats.EntitlementsByResourceType = entitlementCounts
+
+		for _, entitlementsCount := range entitlementCounts {
+			stats.Entitlements += entitlementsCount
+		}
 
 		grantCounts, err := c.countBySyncAndResourceType(ctx, grants.Name(), syncId)
 		if err != nil {
@@ -1246,8 +1372,19 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 		}
 	}
 
+	assetCount, err := c.countBySync(ctx, assets.Name(), syncId)
+	if err != nil {
+		return nil, nil, fmt.Errorf("count assets: %w", err)
+	}
+	stats.Assets = assetCount
+
+	// Lift timing / call stats from the syncer token into the stats we
+	// are about to cache. Older count-only caches are left as-is on
+	// the fast path above.
+	c1zstore.ApplySyncTokenStats(stats, sync.SyncToken)
+
 	// If sync is ended and c1z is not read-only, save stats to the database.
-	if sync.GetEndedAt() != nil && !c.readOnly {
+	if sync.EndedAt != nil && !c.readOnly {
 		statsJSON, err := json.Marshal(stats)
 		if err != nil {
 			return nil, nil, fmt.Errorf("c1file-stats: error marshalling stats: %w", err)
@@ -1263,10 +1400,18 @@ func (c *C1File) stats(ctx context.Context, syncType connectorstore.SyncType, sy
 		if err != nil {
 			return nil, nil, fmt.Errorf("c1file-stats: error saving stats: %w", err)
 		}
-		c.dbUpdated = true
+		c.dbUpdated.Store(true)
 	}
 
-	return sync, stats, nil
+	return &reader_v2.SyncRun{
+		Id:           sync.ID,
+		StartedAt:    toTimeStamp(sync.StartedAt),
+		EndedAt:      toTimeStamp(sync.EndedAt),
+		SyncToken:    sync.SyncToken,
+		SyncType:     string(sync.Type),
+		ParentSyncId: sync.ParentSyncID,
+		Stats:        stats,
+	}, stats, nil
 }
 
 // grantStats introspects the database and returns the count of grants for the given sync run.
@@ -1287,6 +1432,24 @@ func (c *C1File) grantStats(ctx context.Context, syncType connectorstore.SyncTyp
 	}
 
 	return statsMap, nil
+}
+
+// countBySync returns the number of rows in tableName for syncID.
+func (c *C1File) countBySync(ctx context.Context, tableName string, syncID string) (int64, error) {
+	q := c.db.From(tableName).
+		Where(goqu.C("sync_id").Eq(syncID)).
+		Select(goqu.COUNT("*"))
+
+	query, args, err := q.ToSQL()
+	if err != nil {
+		return 0, err
+	}
+
+	var n int64
+	if err := c.db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // countBySyncAndResourceType issues a single GROUP BY query that returns
@@ -1369,7 +1532,7 @@ func (c *C1File) OutputFilepath() (string, error) {
 func (c *C1File) Metadata() connectorstore.StoreMetadata {
 	engine := c.engine
 	if engine == "" {
-		engine = EngineSQLite
+		engine = c1zstore.EngineSQLite
 	}
 	return connectorstore.StoreMetadata{
 		Engine: string(engine),
@@ -1422,12 +1585,35 @@ func (c *C1File) CurrentDBSizeBytes() (int64, error) {
 // compile time instead of silently turning off the expand-log size fields.
 var _ connectorstore.DBSizeProvider = (*C1File)(nil)
 
+// AttachFile attaches another database to this file's connection and
+// validates the attached catalog's schema before returning it for use.
+//
+// The ATTACH, the validation, and a rejection-DETACH all run on ONE leased
+// *sql.Conn: attachments are per-connection state, so validating any other
+// connection would prove nothing. If the rejection-DETACH fails, the host
+// connection is closed rather than left holding an unvalidated attachment.
+//
+// Consumers of C1FileAttached run on the single-connection pool
+// (SetMaxOpenConns(1)), where the leased connection is the pool's only
+// connection, so later statements see the same attachment.
 func (c *C1File) AttachFile(other *C1File, dbName string) (*C1FileAttached, error) {
-	_, err := c.db.Exec(`ATTACH DATABASE ? AS ?`, other.dbFilePath, dbName)
+	ctx := context.Background()
+	conn, err := c.rawDb.Conn(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("attach-file: error leasing connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "ATTACH DATABASE ? AS ?", other.dbFilePath, dbName); err != nil {
 		return nil, err
 	}
-
+	if err := validateSQLiteSchema(ctx, conn, dbName); err != nil {
+		if _, detachErr := conn.ExecContext(ctx, "DETACH DATABASE ?", dbName); detachErr != nil {
+			closeErr := c.closeRawDB(ctx)
+			return nil, errors.Join(err, fmt.Errorf("attach-file: rejection-detach failed; host closed: %w", detachErr), closeErr)
+		}
+		return nil, err
+	}
 	return &C1FileAttached{
 		safe: true,
 		file: c,

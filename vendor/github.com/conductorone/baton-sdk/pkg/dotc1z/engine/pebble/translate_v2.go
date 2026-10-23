@@ -21,9 +21,10 @@ import (
 
 // --- Grant ---
 
-// V2GrantToV3 produces a v3.GrantRecord from a v2.Grant. The caller
-// supplies sync_id since v2.Grant has no sync_id field (the connector
-// writes are scoped to the engine's current sync).
+// V2GrantToV3 produces a v3.GrantRecord from a v2.Grant. The syncID
+// parameter is retained for call-site symmetry with other translators;
+// v3 data records no longer store sync_id in the value because sync scope is
+// encoded in Pebble keys by the engine write path.
 //
 // The GrantExpandable annotation (if any) is extracted into the
 // dedicated Expansion field and stripped from Annotations, and
@@ -38,7 +39,6 @@ func V2GrantToV3(syncID string, g *v2.Grant) *v3.GrantRecord {
 	}
 	expansion, annotations := extractV2Expansion(g.GetAnnotations())
 	return v3.GrantRecord_builder{
-		SyncId:         syncID,
 		ExternalId:     g.GetId(),
 		Entitlement:    entitlementToRef(g.GetEntitlement()),
 		Principal:      resourceToPrincipalRef(g.GetPrincipal()),
@@ -123,7 +123,7 @@ func V3GrantToV2(r *v3.GrantRecord) *v2.Grant {
 		}
 	}
 	return v2.Grant_builder{
-		Id:          r.GetExternalId(),
+		Id:          publicGrantRecordID(r),
 		Entitlement: entitlementRefToStub(r.GetEntitlement()),
 		Principal:   principalRefToStubResource(r.GetPrincipal()),
 		Annotations: anns,
@@ -215,7 +215,7 @@ func newGrantTranslateArena(n int) *grantTranslateArena {
 // Returns a pointer into the arena's grantRecords slice; the caller
 // must not retain it past the arena's lifetime. Behaviorally
 // equivalent to V2GrantToV3 for all valid inputs.
-func (a *grantTranslateArena) translateV2Grant(syncID string, g *v2.Grant) *v3.GrantRecord {
+func (a *grantTranslateArena) translateV2Grant(_ string, g *v2.Grant) *v3.GrantRecord {
 	if g == nil {
 		return nil
 	}
@@ -241,7 +241,6 @@ func (a *grantTranslateArena) translateV2Grant(syncID string, g *v2.Grant) *v3.G
 	}
 	a.grantRecords = append(a.grantRecords, v3.GrantRecord{})
 	rec := &a.grantRecords[len(a.grantRecords)-1]
-	rec.SetSyncId(syncID)
 	rec.SetExternalId(g.GetId())
 	if entRef != nil {
 		rec.SetEntitlement(entRef)
@@ -268,6 +267,8 @@ func entitlementRefToStub(ref *v3.EntitlementRef) *v2.Entitlement {
 		return nil
 	}
 	return v2.Entitlement_builder{
+		// The ref carries the raw connector id; emit it verbatim — external
+		// ids are an external-consumer contract and are never re-encoded.
 		Id: ref.GetEntitlementId(),
 		Resource: v2.Resource_builder{
 			Id: v2.ResourceId_builder{
@@ -326,7 +327,8 @@ func v3GrantSourcesToV2(m map[string]*v3.GrantSourceRecord) *v2.GrantSources {
 
 // --- Resource ---
 
-// V2ResourceToV3 maps v2.Resource → v3.ResourceRecord. Caller supplies sync_id.
+// V2ResourceToV3 maps v2.Resource → v3.ResourceRecord. syncID is not stored in
+// the value; Pebble keys carry sync scope.
 func V2ResourceToV3(syncID string, r *v2.Resource) *v3.ResourceRecord {
 	if r == nil {
 		return nil
@@ -339,13 +341,55 @@ func V2ResourceToV3(syncID string, r *v2.Resource) *v3.ResourceRecord {
 		}.Build()
 	}
 	return v3.ResourceRecord_builder{
-		SyncId:         syncID,
-		ResourceTypeId: r.GetId().GetResourceType(),
-		ResourceId:     r.GetId().GetResource(),
-		DisplayName:    r.GetDisplayName(),
-		Description:    r.GetDescription(),
-		Parent:         parent,
-		Annotations:    r.GetAnnotations(),
+		ResourceTypeId:      r.GetId().GetResourceType(),
+		ResourceId:          r.GetId().GetResource(),
+		DisplayName:         r.GetDisplayName(),
+		Description:         r.GetDescription(),
+		Parent:              parent,
+		Annotations:         r.GetAnnotations(),
+		CreatedAt:           r.GetCreatedAt(),
+		Profile:             r.GetProfile(),
+		Status:              v2StatusToV3(r.GetStatus()),
+		IconAssetExternalId: v2AssetExternalID(r.GetIcon()),
+	}.Build()
+}
+
+func v2AssetExternalID(a *v2.AssetRef) string {
+	if a == nil {
+		return ""
+	}
+	return a.GetId()
+}
+
+func assetExternalIDToV2AssetRef(assetExternalID string) *v2.AssetRef {
+	if assetExternalID == "" {
+		return nil
+	}
+	return v2.AssetRef_builder{
+		Id: assetExternalID,
+	}.Build()
+}
+
+// v2StatusToV3 maps v2.Status → the v3-owned StatusRecord mirror.
+// Enum values match by construction, so the cast is lossless.
+func v2StatusToV3(s *v2.Status) *v3.StatusRecord {
+	if s == nil {
+		return nil
+	}
+	return v3.StatusRecord_builder{
+		Status:  v3.StatusRecord_ResourceStatus(s.GetStatus()),
+		Details: s.GetDetails(),
+	}.Build()
+}
+
+// v3StatusToV2 reverses v2StatusToV3.
+func v3StatusToV2(s *v3.StatusRecord) *v2.Status {
+	if s == nil {
+		return nil
+	}
+	return v2.Status_builder{
+		Status:  v2.Status_ResourceStatus(s.GetStatus()),
+		Details: s.GetDetails(),
 	}.Build()
 }
 
@@ -371,6 +415,10 @@ func V3ResourceToV2(r *v3.ResourceRecord) *v2.Resource {
 		DisplayName:      r.GetDisplayName(),
 		Description:      r.GetDescription(),
 		Annotations:      r.GetAnnotations(),
+		Profile:          r.GetProfile(),
+		Status:           v3StatusToV2(r.GetStatus()),
+		CreatedAt:        r.GetCreatedAt(),
+		Icon:             assetExternalIDToV2AssetRef(r.GetIconAssetExternalId()),
 	}.Build()
 }
 
@@ -387,7 +435,6 @@ func V2ResourceTypeToV3(syncID string, rt *v2.ResourceType) *v3.ResourceTypeReco
 		traits = append(traits, traitToString(t))
 	}
 	return v3.ResourceTypeRecord_builder{
-		SyncId:            syncID,
 		ExternalId:        rt.GetId(),
 		DisplayName:       rt.GetDisplayName(),
 		Traits:            traits,
@@ -465,7 +512,6 @@ func V2EntitlementToV3(syncID string, e *v2.Entitlement) *v3.EntitlementRecord {
 		}
 	}
 	return v3.EntitlementRecord_builder{
-		SyncId:                     syncID,
 		ExternalId:                 e.GetId(),
 		Resource:                   res,
 		DisplayName:                e.GetDisplayName(),
@@ -504,6 +550,7 @@ func V3EntitlementToV2(r *v3.EntitlementRecord) *v2.Entitlement {
 		}
 	}
 	return v2.Entitlement_builder{
+		// Stored raw external id, emitted verbatim.
 		Id:          r.GetExternalId(),
 		Resource:    resource,
 		DisplayName: r.GetDisplayName(),

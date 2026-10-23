@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // PutResourceTypeRecord writes a resource_type record. No secondary
@@ -20,46 +21,57 @@ func (e *Engine) PutResourceTypeRecord(ctx context.Context, r *v3.ResourceTypeRe
 }
 
 // PutResourceTypeRecords writes N resource_types in one batch.
-// Fresh-sync uses pebble.NoSync (one fsync at EndFreshSync).
 func (e *Engine) PutResourceTypeRecords(ctx context.Context, records ...*v3.ResourceTypeRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
 	return e.withWrite(func() error {
-		batch := e.db.NewBatch()
+		if err := e.requireCurrentSync(); err != nil {
+			return err
+		}
+		batch := e.db.NewRecordBatch()
 		defer batch.Close()
-		fresh := e.IsFreshSync()
-		for _, r := range records {
-			if r == nil {
-				continue
-			}
-			idBytes, err := e.resolveSyncBytes(r.GetSyncId())
-			if err != nil {
-				return err
-			}
-			key := encodeResourceTypeKey(idBytes, r.GetExternalId())
-			val, err := marshalRecord(r)
-			if err != nil {
-				return err
-			}
-			if err := batch.Set(key, val, nil); err != nil {
-				return err
-			}
+		if _, err := stageResourceTypeRecords(batch, records); err != nil {
+			return err
 		}
-		opts := writeOpts(e.opts.durability)
-		if fresh {
-			opts = pebble.NoSync
-		}
+		opts := recordWriteOpts
 		return batch.Commit(opts)
 	})
 }
 
-func (e *Engine) GetResourceTypeRecord(ctx context.Context, syncID, externalID string) (*v3.ResourceTypeRecord, error) {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return nil, err
+func stageResourceTypeRecords(batch *rawdb.RecordBatch, records []*v3.ResourceTypeRecord) (uint64, error) {
+	var last map[string]int
+	if len(records) > 1 {
+		last = make(map[string]int, len(records))
+		for i, r := range records {
+			if r != nil {
+				last[r.GetExternalId()] = i
+			}
+		}
 	}
-	key := encodeResourceTypeKey(idBytes, externalID)
+	var staged uint64
+	for i, r := range records {
+		if r == nil {
+			continue
+		}
+		if last != nil && last[r.GetExternalId()] != i {
+			continue
+		}
+		key := encodeResourceTypeKey(r.GetExternalId())
+		val, err := marshalRecord(r)
+		if err != nil {
+			return 0, err
+		}
+		if err := batch.StageResourceTypePut(key, val); err != nil {
+			return 0, err
+		}
+		staged++
+	}
+	return staged, nil
+}
+
+func (e *Engine) GetResourceTypeRecord(ctx context.Context, externalID string) (*v3.ResourceTypeRecord, error) {
+	key := encodeResourceTypeKey(externalID)
 	val, closer, err := e.db.Get(key)
 	if err != nil {
 		return nil, err
@@ -72,22 +84,22 @@ func (e *Engine) GetResourceTypeRecord(ctx context.Context, syncID, externalID s
 	return r, nil
 }
 
-func (e *Engine) DeleteResourceTypeRecord(ctx context.Context, syncID, externalID string) error {
+func (e *Engine) DeleteResourceTypeRecord(ctx context.Context, externalID string) error {
 	return e.withWrite(func() error {
-		idBytes, err := e.resolveSyncBytes(syncID)
-		if err != nil {
+		// Record family, not engine-meta: resource types are record
+		// rows. A one-op RecordBatch commit is durability-identical to
+		// the old single Delete (the commit carries the write options).
+		batch := e.db.NewRecordBatch()
+		defer batch.Close()
+		if err := batch.StageResourceTypeDelete(encodeResourceTypeKey(externalID)); err != nil {
 			return err
 		}
-		return e.db.Delete(encodeResourceTypeKey(idBytes, externalID), writeOpts(e.opts.durability))
+		return batch.Commit(writeOpts(e.opts.durability))
 	})
 }
 
-func (e *Engine) IterateResourceTypesBySync(ctx context.Context, syncID string, yield func(*v3.ResourceTypeRecord) bool) error {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return err
-	}
-	prefix := encodeResourceTypePrefix(idBytes)
+func (e *Engine) IterateResourceTypes(ctx context.Context, yield func(*v3.ResourceTypeRecord) bool) error {
+	prefix := encodeResourceTypePrefix()
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: upperBoundOf(prefix),

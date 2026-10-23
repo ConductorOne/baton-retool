@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/conductorone/baton-sdk/pkg/annotations"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 	"github.com/conductorone/baton-sdk/pkg/uotel/uotelzap"
 
@@ -64,9 +65,17 @@ type c1ApiTaskManager struct {
 	skipFullSync                        bool
 	externalResourceC1Z                 string
 	externalResourceEntitlementIdFilter string
+	externalResourceTraits              []v2.ResourceType_Trait
 	targetedSyncResources               []*v2.Resource
 	syncResourceTypeIDs                 []string
 	workerCount                         int
+	storageEngine                       c1zstore.Engine
+
+	// previousSyncSparePath is non-empty when the connector opted into
+	// ETag replay (keepPreviousSyncC1Z): the fixed, client-id-namespaced
+	// location of the retained previous-sync c1z. Computed once at
+	// construction so every full-sync task agrees on the same spare.
+	previousSyncSparePath string
 
 	// runnerShouldDebug is flipped by the StartDebugging task handler (which
 	// runs on a task-processing goroutine) and read by the runner loop via
@@ -421,9 +430,12 @@ func (c *c1ApiTaskManager) Process(ctx context.Context, task *v1.Task, cc types.
 			c.skipFullSync,
 			c.externalResourceC1Z,
 			c.externalResourceEntitlementIdFilter,
+			c.externalResourceTraits,
 			c.targetedSyncResources,
 			c.syncResourceTypeIDs,
 			c.workerCount,
+			c.storageEngine,
+			c.previousSyncSparePath,
 		)
 	case taskTypes.HelloType:
 		handler = newHelloTaskHandler(task, tHelpers)
@@ -439,6 +451,8 @@ func (c *c1ApiTaskManager) Process(ctx context.Context, task *v1.Task, cc types.
 		handler = newDeleteResourceTaskHandler(task, tHelpers)
 	case taskTypes.RotateCredentialsType:
 		handler = newRotateCredentialsTaskHandler(task, tHelpers)
+	case taskTypes.IssueCredentialType:
+		handler = newIssueCredentialTaskHandler(task, tHelpers)
 	case taskTypes.CreateTicketType:
 		handler = newCreateTicketTaskHandler(task, tHelpers)
 	case taskTypes.ListTicketSchemasType:
@@ -487,14 +501,25 @@ func NewC1TaskManager(
 	skipFullSync bool,
 	externalC1Z string,
 	externalResourceEntitlementIdFilter string,
+	externalResourceTraits []v2.ResourceType_Trait,
 	targetedSyncResources []*v2.Resource,
 	syncResourceTypeIDs []string,
 	workerCount int,
+	storageEngine c1zstore.Engine,
 	taskConcurrency int,
+	keepPreviousSyncC1Z bool,
 ) (BootstrappingTaskManager, error) {
 	serviceClient, err := newServiceClient(ctx, clientID, clientSecret)
 	if err != nil {
 		return nil, err
+	}
+
+	// The spare path embeds a digest of the client id so two instances
+	// with different credentials on one host can never replay from each
+	// other's previous sync; see previousSyncSparePath.
+	sparePath := ""
+	if keepPreviousSyncC1Z {
+		sparePath = previousSyncSparePath(tempDir, clientID)
 	}
 
 	return &c1ApiTaskManager{
@@ -505,8 +530,11 @@ func NewC1TaskManager(
 		skipFullSync:                        skipFullSync,
 		externalResourceC1Z:                 externalC1Z,
 		externalResourceEntitlementIdFilter: externalResourceEntitlementIdFilter,
+		externalResourceTraits:              externalResourceTraits,
 		targetedSyncResources:               targetedSyncResources,
 		syncResourceTypeIDs:                 syncResourceTypeIDs,
 		workerCount:                         workerCount,
+		storageEngine:                       storageEngine,
+		previousSyncSparePath:               sparePath,
 	}, nil
 }

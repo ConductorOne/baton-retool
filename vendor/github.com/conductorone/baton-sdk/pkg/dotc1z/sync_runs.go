@@ -24,6 +24,7 @@ import (
 
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
@@ -48,7 +49,10 @@ create table if not exists %s (
     linked_sync_id text not null default '',
     supports_diff integer not null default 0,
     grants_backfilled integer not null default 0,
-		stats text
+		stats text,
+    ingest_invariant_generation text not null default '',
+    ingest_invariant_coverage text not null default '',
+    ingest_invariant_mode text not null default ''
 );
 create unique index if not exists %s on %s (sync_id);`
 
@@ -103,7 +107,12 @@ func (r *syncRunsTable) Migrations(ctx context.Context, db *goqu.Database) (bool
 		migrated = true
 	}
 
-	// Check if linked_sync_id column exists
+	// linked_sync_id is vestigial: only the removed diff-sync feature ever
+	// wrote non-empty values, and nothing reads it anymore. The column stays
+	// in the schema (and this migration stays) so every opened file has a
+	// uniform sync_runs shape — CloneSync/SnapshotTo copy rows using the
+	// source's PRAGMA table_info column list into a fresh-DDL destination,
+	// and older SDKs still SELECT the column by name.
 	var linkedSyncIDExists int
 	err = db.QueryRowContext(ctx, fmt.Sprintf("select count(*) from pragma_table_info('%s') where name='linked_sync_id'", r.Name())).Scan(&linkedSyncIDExists)
 	if err != nil {
@@ -147,13 +156,56 @@ func (r *syncRunsTable) Migrations(ctx context.Context, db *goqu.Database) (bool
 		migrated = true
 	}
 
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "ingest_invariant_generation", ddl: "text not null default ''"},
+		{name: "ingest_invariant_coverage", ddl: "text not null default ''"},
+		{name: "ingest_invariant_mode", ddl: "text not null default ''"},
+	} {
+		_, err = db.ExecContext(ctx, fmt.Sprintf("alter table %s add column %s %s", r.Name(), column.name, column.ddl))
+		if err != nil {
+			if !isAlreadyExistsError(err) {
+				return false, err
+			}
+		} else {
+			migrated = true
+		}
+	}
+
 	return migrated, nil
+}
+
+func parseIngestInvariantVerification(
+	generation string,
+	coverageJSON string,
+	mode string,
+) c1zstore.IngestInvariantVerification {
+	if generation == "" {
+		return c1zstore.IngestInvariantVerification{}
+	}
+	var coverage []string
+	if err := json.Unmarshal([]byte(coverageJSON), &coverage); err != nil {
+		// Malformed provenance must fail closed: expose it as unverified so a
+		// future compaction consumer cannot trust a partial/corrupt marker.
+		return c1zstore.IngestInvariantVerification{}
+	}
+	verification := c1zstore.IngestInvariantVerification{
+		Generation: generation,
+		Coverage:   coverage,
+		Mode:       c1zstore.IngestInvariantVerificationMode(mode),
+	}
+	if !verification.IsVerified() {
+		return c1zstore.IngestInvariantVerification{}
+	}
+	return verification
 }
 
 // getCachedViewSyncRun returns the cached sync run for read operations.
 // This avoids N+1 queries when paginating through listConnectorObjects.
 // The cache is invalidated when a sync starts or ends.
-func (c *C1File) getCachedViewSyncRun(ctx context.Context) (*SyncRun, error) {
+func (c *C1File) getCachedViewSyncRun(ctx context.Context) (*c1zstore.SyncRun, error) {
 	ctx, span := tracer.Start(ctx, "C1File.getCachedViewSyncRun")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -187,7 +239,23 @@ func (c *C1File) invalidateCachedViewSyncRun() {
 	c.cachedViewSyncErr = nil
 }
 
-func (c *C1File) getLatestUnfinishedSync(ctx context.Context, syncType connectorstore.SyncType) (*SyncRun, error) {
+// unfinishedSyncMaxAge bounds how old an in-progress sync may be and still be
+// resumable: a sync that started but never reached EndSync more than a week ago
+// is abandoned, not live work. Mirrored by the Pebble engine's identically
+// named constant (pkg/dotc1z/engine/pebble/sync_runs.go); the two must agree or
+// the engines disagree about which syncs are resumable.
+const unfinishedSyncMaxAge = 7 * 24 * time.Hour
+
+// unfinishedSyncCutoff renders the oldest started_at an unfinished sync may
+// carry and still be resumable, in sqliteTimeFormat so it can be compared
+// against started_at directly. Shared by getLatestUnfinishedSync (which sync
+// is resumable) and resolveConvertSyncID (which sync is worth converting) so
+// the two cannot disagree about what "abandoned" means.
+func unfinishedSyncCutoff() string {
+	return time.Now().Add(-unfinishedSyncMaxAge).Format(sqliteTimeFormat)
+}
+
+func (c *C1File) getLatestUnfinishedSync(ctx context.Context, syncType connectorstore.SyncType) (*c1zstore.SyncRun, error) {
 	ctx, span := tracer.Start(ctx, "C1File.getLatestUnfinishedSync")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -198,10 +266,15 @@ func (c *C1File) getLatestUnfinishedSync(ctx context.Context, syncType connector
 	}
 
 	// Don't resume syncs that started over a week ago
-	oneWeekAgo := time.Now().AddDate(0, 0, -7)
-	ret := &SyncRun{}
+	oneWeekAgo := unfinishedSyncCutoff()
+	ret := &c1zstore.SyncRun{}
 	q := c.db.From(syncRuns.Name())
-	q = q.Select("sync_id", "started_at", "ended_at", "sync_token", "sync_type", "parent_sync_id", "linked_sync_id", "supports_diff", "stats")
+	q = q.Select(
+		"sync_id", "started_at", "ended_at", "sync_token", "sync_type",
+		"parent_sync_id", "supports_diff",
+		"ingest_invariant_generation", "ingest_invariant_coverage", "ingest_invariant_mode",
+		"stats",
+	)
 	q = q.Where(goqu.C("ended_at").IsNull())
 	q = q.Where(goqu.C("started_at").Gte(oneWeekAgo))
 	q = q.Order(goqu.C("started_at").Desc())
@@ -217,7 +290,12 @@ func (c *C1File) getLatestUnfinishedSync(ctx context.Context, syncType connector
 
 	row := c.db.QueryRowContext(ctx, query, args...)
 	statsBytes := &[]byte{}
-	err = row.Scan(&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type, &ret.ParentSyncID, &ret.LinkedSyncID, &ret.SupportsDiff, &statsBytes)
+	var generation, coverageJSON, mode string
+	err = row.Scan(
+		&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type,
+		&ret.ParentSyncID, &ret.SupportsDiff,
+		&generation, &coverageJSON, &mode, &statsBytes,
+	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -226,11 +304,12 @@ func (c *C1File) getLatestUnfinishedSync(ctx context.Context, syncType connector
 	}
 
 	ret.Stats = parseStats(ctx, statsBytes)
+	ret.IngestInvariantVerification = parseIngestInvariantVerification(generation, coverageJSON, mode)
 
 	return ret, nil
 }
 
-func (c *C1File) getFinishedSync(ctx context.Context, offset uint, syncType connectorstore.SyncType) (*SyncRun, error) {
+func (c *C1File) getFinishedSync(ctx context.Context, offset uint, syncType connectorstore.SyncType) (*c1zstore.SyncRun, error) {
 	ctx, span := tracer.Start(ctx, "C1File.getFinishedSync")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -245,9 +324,14 @@ func (c *C1File) getFinishedSync(ctx context.Context, offset uint, syncType conn
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sync type: %s", syncType)
 	}
 
-	ret := &SyncRun{}
+	ret := &c1zstore.SyncRun{}
 	q := c.db.From(syncRuns.Name())
-	q = q.Select("sync_id", "started_at", "ended_at", "sync_token", "sync_type", "parent_sync_id", "linked_sync_id", "supports_diff", "stats")
+	q = q.Select(
+		"sync_id", "started_at", "ended_at", "sync_token", "sync_type",
+		"parent_sync_id", "supports_diff",
+		"ingest_invariant_generation", "ingest_invariant_coverage", "ingest_invariant_mode",
+		"stats",
+	)
 	q = q.Where(goqu.C("ended_at").IsNotNull())
 	if syncType != connectorstore.SyncTypeAny {
 		q = q.Where(goqu.C("sync_type").Eq(syncType))
@@ -270,7 +354,12 @@ func (c *C1File) getFinishedSync(ctx context.Context, offset uint, syncType conn
 
 	row := c.db.QueryRowContext(ctx, query, args...)
 	statsBytes := &[]byte{}
-	err = row.Scan(&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type, &ret.ParentSyncID, &ret.LinkedSyncID, &ret.SupportsDiff, &statsBytes)
+	var generation, coverageJSON, mode string
+	err = row.Scan(
+		&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type,
+		&ret.ParentSyncID, &ret.SupportsDiff,
+		&generation, &coverageJSON, &mode, &statsBytes,
+	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -279,25 +368,29 @@ func (c *C1File) getFinishedSync(ctx context.Context, offset uint, syncType conn
 	}
 
 	ret.Stats = parseStats(ctx, statsBytes)
+	ret.IngestInvariantVerification = parseIngestInvariantVerification(generation, coverageJSON, mode)
 
 	return ret, nil
 }
 
 func parseStats(ctx context.Context, statsBytes *[]byte) *reader_v2.SyncStats {
+	l := ctxzap.Extract(ctx)
+
 	if statsBytes == nil || len(*statsBytes) == 0 {
+		l.Debug("no stats found")
 		return nil
 	}
 	ret := &reader_v2.SyncStats{}
 	err := json.Unmarshal(*statsBytes, ret)
 	if err != nil {
 		// Ignore error parsing stats. We will recalculate them if Stats() is called.
-		ctxzap.Extract(ctx).Warn("error parsing stats", zap.Error(err))
+		l.Warn("error parsing stats", zap.Error(err))
 		return nil
 	}
 	return ret
 }
 
-func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize uint32) ([]*SyncRun, string, error) {
+func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize uint32) ([]*c1zstore.SyncRun, string, error) {
 	ctx, span := tracer.Start(ctx, "C1File.ListSyncRuns")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -308,7 +401,12 @@ func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize ui
 	}
 
 	q := c.db.From(syncRuns.Name()).Prepared(true)
-	q = q.Select("id", "sync_id", "started_at", "ended_at", "sync_token", "sync_type", "parent_sync_id", "linked_sync_id", "supports_diff", "stats")
+	q = q.Select(
+		"id", "sync_id", "started_at", "ended_at", "sync_token", "sync_type",
+		"parent_sync_id", "supports_diff",
+		"ingest_invariant_generation", "ingest_invariant_coverage", "ingest_invariant_mode",
+		"stats",
+	)
 
 	if pageToken != "" {
 		q = q.Where(goqu.C("id").Gte(pageToken))
@@ -321,7 +419,7 @@ func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize ui
 	q = q.Order(goqu.C("id").Asc())
 	q = q.Limit(uint(pageSize + 1))
 
-	var ret []*SyncRun
+	var ret []*c1zstore.SyncRun
 
 	query, args, err := q.ToSQL()
 	if err != nil {
@@ -343,13 +441,19 @@ func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize ui
 		}
 		statsBytes := &[]byte{}
 		rowId := 0
-		data := &SyncRun{}
-		err := rows.Scan(&rowId, &data.ID, &data.StartedAt, &data.EndedAt, &data.SyncToken, &data.Type, &data.ParentSyncID, &data.LinkedSyncID, &data.SupportsDiff, &statsBytes)
+		data := &c1zstore.SyncRun{}
+		var generation, coverageJSON, mode string
+		err := rows.Scan(
+			&rowId, &data.ID, &data.StartedAt, &data.EndedAt, &data.SyncToken, &data.Type,
+			&data.ParentSyncID, &data.SupportsDiff,
+			&generation, &coverageJSON, &mode, &statsBytes,
+		)
 		if err != nil {
 			return nil, "", err
 		}
 
 		data.Stats = parseStats(ctx, statsBytes)
+		data.IngestInvariantVerification = parseIngestInvariantVerification(generation, coverageJSON, mode)
 		lastRow = rowId
 		ret = append(ret, data)
 	}
@@ -365,6 +469,8 @@ func (c *C1File) ListSyncRuns(ctx context.Context, pageToken string, pageSize ui
 	return ret, nextPageToken, nil
 }
 
+// LatestSyncID returns the ID of the most recently finished sync of the given type.
+// If syncType is connectorstore.SyncTypeAny, it will return the most recently finished sync of any type.
 func (c *C1File) LatestSyncID(ctx context.Context, syncType connectorstore.SyncType) (string, error) {
 	ctx, span := tracer.Start(ctx, "C1File.LatestSyncID")
 	var err error
@@ -426,7 +532,7 @@ func (c *C1File) LatestFinishedSyncID(ctx context.Context, syncType connectorsto
 	return s.ID, nil
 }
 
-func (c *C1File) getSync(ctx context.Context, syncID string) (*SyncRun, error) {
+func (c *C1File) getSync(ctx context.Context, syncID string) (*c1zstore.SyncRun, error) {
 	ctx, span := tracer.Start(ctx, "C1File.getSync")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -436,10 +542,15 @@ func (c *C1File) getSync(ctx context.Context, syncID string) (*SyncRun, error) {
 		return nil, err
 	}
 
-	ret := &SyncRun{}
+	ret := &c1zstore.SyncRun{}
 
 	q := c.db.From(syncRuns.Name())
-	q = q.Select("sync_id", "started_at", "ended_at", "sync_token", "sync_type", "parent_sync_id", "linked_sync_id", "supports_diff", "stats")
+	q = q.Select(
+		"sync_id", "started_at", "ended_at", "sync_token", "sync_type",
+		"parent_sync_id", "supports_diff",
+		"ingest_invariant_generation", "ingest_invariant_coverage", "ingest_invariant_mode",
+		"stats",
+	)
 	q = q.Where(goqu.C("sync_id").Eq(syncID))
 
 	query, args, err := q.ToSQL()
@@ -448,17 +559,23 @@ func (c *C1File) getSync(ctx context.Context, syncID string) (*SyncRun, error) {
 	}
 	row := c.db.QueryRowContext(ctx, query, args...)
 	var statsBytes *[]byte
-	err = row.Scan(&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type, &ret.ParentSyncID, &ret.LinkedSyncID, &ret.SupportsDiff, &statsBytes)
+	var generation, coverageJSON, mode string
+	err = row.Scan(
+		&ret.ID, &ret.StartedAt, &ret.EndedAt, &ret.SyncToken, &ret.Type,
+		&ret.ParentSyncID, &ret.SupportsDiff,
+		&generation, &coverageJSON, &mode, &statsBytes,
+	)
 	if err != nil {
-		return nil, err
+		return nil, c1zstore.AdaptNotFound(err)
 	}
 
 	ret.Stats = parseStats(ctx, statsBytes)
+	ret.IngestInvariantVerification = parseIngestInvariantVerification(generation, coverageJSON, mode)
 
 	return ret, nil
 }
 
-func (c *C1File) getCurrentSync(ctx context.Context) (*SyncRun, error) {
+func (c *C1File) getCurrentSync(ctx context.Context) (*c1zstore.SyncRun, error) {
 	ctx, span := tracer.Start(ctx, "C1File.getCurrentSync")
 	var err error
 	defer func() { uotel.EndSpanWithError(span, err) }()
@@ -512,7 +629,7 @@ func (c *C1File) CheckpointSync(ctx context.Context, syncToken string) error {
 		return err
 	}
 
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	return nil
 }
@@ -583,7 +700,7 @@ func (c *C1File) StartOrResumeSync(ctx context.Context, syncType connectorstore.
 
 	resumedSyncID, err := c.ResumeSync(ctx, syncType, syncID)
 	if err != nil {
-		if status.Code(err) != codes.NotFound && !errors.Is(err, sql.ErrNoRows) {
+		if status.Code(err) != codes.NotFound {
 			return "", false, err
 		}
 	} else {
@@ -620,10 +737,19 @@ func (c *C1File) StartNewSync(ctx context.Context, syncType connectorstore.SyncT
 		if err != nil {
 			return "", err
 		}
-		if cur != nil && cur.EndedAt == nil && cur.Type != syncType {
-			return "", status.Errorf(codes.FailedPrecondition, "current sync (id %s) is type %s. cannot start %s", cur.ID, cur.Type, syncType)
+		// Only adopt the current sync as the started one when it actually exists
+		// and is still open. An ENDED (cur.EndedAt != nil) or missing (cur == nil)
+		// current sync must NOT be returned here: a caller that scanned existing
+		// syncs and left currentSyncID pointing at a finished sync would otherwise
+		// get that finished sync back and write a fresh sync's records into it.
+		// Fall through to create a brand-new sync instead.
+		if cur != nil && cur.EndedAt == nil {
+			if cur.Type != syncType {
+				return "", status.Errorf(codes.FailedPrecondition, "current sync (id %s) is type %s. cannot start %s", cur.ID, cur.Type, syncType)
+			}
+			return c.currentSyncID, nil
 		}
-		return c.currentSyncID, nil
+		c.currentSyncID = ""
 	}
 
 	switch syncType {
@@ -636,10 +762,6 @@ func (c *C1File) StartNewSync(ctx context.Context, syncType connectorstore.SyncT
 			return "", status.Errorf(codes.InvalidArgument, "parent sync id must be empty for resources only sync")
 		}
 	case connectorstore.SyncTypePartial:
-	case connectorstore.SyncTypePartialUpserts, connectorstore.SyncTypePartialDeletions:
-		// Diff syncs carry the base sync as their parent; the linked
-		// pairing (upserts ↔ deletions) is set separately via
-		// SetSyncLink since the partner's id may not exist yet.
 	case connectorstore.SyncTypeAny:
 		return "", status.Errorf(codes.InvalidArgument, "sync cannot be started with SyncTypeAny")
 	default:
@@ -659,10 +781,6 @@ func (c *C1File) StartNewSync(ctx context.Context, syncType connectorstore.SyncT
 }
 
 func (c *C1File) insertSyncRun(ctx context.Context, syncID string, syncType connectorstore.SyncType, parentSyncID string) error {
-	return c.insertSyncRunWithLink(ctx, syncID, syncType, parentSyncID, "")
-}
-
-func (c *C1File) insertSyncRunWithLink(ctx context.Context, syncID string, syncType connectorstore.SyncType, parentSyncID string, linkedSyncID string) error {
 	if c.readOnly {
 		return ErrReadOnly
 	}
@@ -675,11 +793,10 @@ func (c *C1File) insertSyncRunWithLink(ctx context.Context, syncID string, syncT
 	q := c.db.Insert(syncRuns.Name())
 	q = q.Rows(goqu.Record{
 		"sync_id":           syncID,
-		"started_at":        time.Now().Format("2006-01-02 15:04:05.999999999"),
+		"started_at":        time.Now().Format(sqliteTimeFormat),
 		"sync_token":        "",
 		"sync_type":         syncType,
 		"parent_sync_id":    parentSyncID,
-		"linked_sync_id":    linkedSyncID,
 		"grants_backfilled": 1, // New syncs do not require grants backfill.
 	})
 
@@ -692,7 +809,7 @@ func (c *C1File) insertSyncRunWithLink(ctx context.Context, syncID string, syncT
 	if err != nil {
 		return err
 	}
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 	return nil
 }
 
@@ -733,7 +850,7 @@ func (c *C1File) EndSync(ctx context.Context) error {
 func (c *C1File) endSyncRun(ctx context.Context, syncID string) error {
 	q := c.db.Update(syncRuns.Name())
 	q = q.Set(goqu.Record{
-		"ended_at": time.Now().Format("2006-01-02 15:04:05.999999999"),
+		"ended_at": time.Now().Format(sqliteTimeFormat),
 	})
 	q = q.Where(goqu.C("sync_id").Eq(syncID))
 	q = q.Where(goqu.C("ended_at").IsNull())
@@ -747,7 +864,7 @@ func (c *C1File) endSyncRun(ctx context.Context, syncID string) error {
 	if err != nil {
 		return err
 	}
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	// Run stats to generate and save the cached stats.
 	_, _, statsErr := c.stats(ctx, connectorstore.SyncTypeAny, syncID, true)
@@ -762,8 +879,10 @@ func (c *C1File) endSyncRun(ctx context.Context, syncID string) error {
 	return nil
 }
 
-// SetSupportsDiff marks the given sync as supporting diff operations.
-// This indicates the sync has SQL-layer grant metadata (is_expandable) properly populated.
+// SetSupportsDiff marks the given sync's data collection as complete with
+// SQL-layer grant metadata (is_expandable) properly populated. The name is
+// historical (the marker once gated diff-sync generation); today it gates
+// `baton rollback-expansion`, which refuses syncs without the marker.
 func (c *C1File) SetSupportsDiff(ctx context.Context, syncID string) error {
 	ctx, span := tracer.Start(ctx, "C1File.SetSupportsDiff")
 	var err error
@@ -788,45 +907,94 @@ func (c *C1File) SetSupportsDiff(ctx context.Context, syncID string) error {
 	if err != nil {
 		return err
 	}
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	return nil
 }
 
-// SetSyncLink sets the linked_sync_id of an existing sync run. Diff
-// sync pairs (partial_upserts ↔ partial_deletions) reference each
-// other bidirectionally; a writer rebuilding such a pair cannot supply
-// the link at StartNewSync time because the partner's id is minted by
-// the store, so the pairing is applied after both runs exist.
-func (c *C1File) SetSyncLink(ctx context.Context, syncID string, linkedSyncID string) error {
-	ctx, span := tracer.Start(ctx, "C1File.SetSyncLink")
-	var err error
-	defer func() { uotel.EndSpanWithError(span, err) }()
-
+func (c *C1File) markIngestInvariantsVerified(
+	ctx context.Context,
+	syncID string,
+	verification c1zstore.IngestInvariantVerification,
+) error {
 	if c.readOnly {
 		return ErrReadOnly
 	}
 	if syncID == "" {
-		return status.Errorf(codes.InvalidArgument, "sync id is required")
+		return status.Error(codes.InvalidArgument, "sync id is required")
+	}
+	if !verification.IsVerified() {
+		return status.Error(codes.InvalidArgument, "ingest invariant verification is incomplete")
+	}
+	coverage, err := json.Marshal(verification.Coverage)
+	if err != nil {
+		return fmt.Errorf("marshal ingest invariant coverage: %w", err)
 	}
 
 	q := c.db.Update(syncRuns.Name())
 	q = q.Set(goqu.Record{
-		"linked_sync_id": linkedSyncID,
+		"ingest_invariant_generation": verification.Generation,
+		"ingest_invariant_coverage":   string(coverage),
+		"ingest_invariant_mode":       string(verification.Mode),
 	})
 	q = q.Where(goqu.C("sync_id").Eq(syncID))
+	// The marker is only ever valid on a sealed sync: an unfinished sync's
+	// data is still mutable, so a verified-but-unfinished row would be a
+	// lie the moment the next write lands. Callers mark AFTER EndSync.
+	q = q.Where(goqu.C("ended_at").IsNotNull())
 
 	query, args, err := q.ToSQL()
 	if err != nil {
 		return err
 	}
-
-	_, err = c.db.ExecContext(ctx, query, args...)
+	result, err := c.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
-	c.dbUpdated = true
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"mark ingest invariants verified: sync %s not found or not finished", syncID)
+	}
+	c.dbUpdated.Store(true)
+	c.invalidateCachedViewSyncRun()
+	return nil
+}
 
+func (c *C1File) clearIngestInvariantVerification(ctx context.Context, syncID string) error {
+	if c.readOnly {
+		return ErrReadOnly
+	}
+	if syncID == "" {
+		return status.Error(codes.InvalidArgument, "sync id is required")
+	}
+	q := c.db.Update(syncRuns.Name())
+	q = q.Set(goqu.Record{
+		"ingest_invariant_generation": "",
+		"ingest_invariant_coverage":   "",
+		"ingest_invariant_mode":       "",
+	})
+	q = q.Where(goqu.C("sync_id").Eq(syncID))
+	query, args, err := q.ToSQL()
+	if err != nil {
+		return err
+	}
+	result, err := c.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return c1zstore.AdaptNotFound(sql.ErrNoRows)
+	}
+	c.dbUpdated.Store(true)
+	c.invalidateCachedViewSyncRun()
 	return nil
 }
 
@@ -870,7 +1038,7 @@ func (c *C1File) Cleanup(ctx context.Context) error {
 		return err
 	}
 
-	var candidates []SyncRun
+	var candidates []c1zstore.SyncRun
 	pageToken := ""
 	for {
 		runs, nextPageToken, err := c.ListSyncRuns(ctx, pageToken, 100)
@@ -915,7 +1083,7 @@ func (c *C1File) Cleanup(ctx context.Context) error {
 		l.Debug("vacuum complete")
 	}
 
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	// If DB is open in WAL mode, truncate the WAL.
 	var journalMode string
@@ -1010,7 +1178,7 @@ func (c *C1File) DeleteSyncRun(ctx context.Context, syncID string) error {
 	deleted += rowsDeleted
 
 	l.Debug("deleted sync run", zap.String("sync_id", syncID), zap.Int64("rows", deleted))
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	return nil
 }
@@ -1048,7 +1216,7 @@ func (c *C1File) Vacuum(ctx context.Context) error {
 		}
 	}
 
-	c.dbUpdated = true
+	c.dbUpdated.Store(true)
 
 	return nil
 }
@@ -1068,6 +1236,19 @@ func (c *C1File) GetSync(ctx context.Context, request *reader_v2.SyncsReaderServ
 	sr, err := c.getSync(ctx, request.GetSyncId())
 	if err != nil {
 		return nil, fmt.Errorf("error getting sync '%s': %w", request.GetSyncId(), err)
+	}
+
+	if sr == nil {
+		return nil, fmt.Errorf("sync '%s' not found", request.GetSyncId())
+	}
+
+	if sr.Stats == nil {
+		_, stats, err := c.stats(ctx, sr.Type, sr.ID, true)
+		if err != nil {
+			return nil, err
+		}
+
+		sr.Stats = stats
 	}
 
 	return reader_v2.SyncsReaderServiceGetSyncResponse_builder{
@@ -1129,6 +1310,15 @@ func (c *C1File) GetLatestFinishedSync(
 		}.Build(), nil
 	}
 
+	if sync.Stats == nil {
+		_, stats, err := c.stats(ctx, sync.Type, sync.ID, true)
+		if err != nil {
+			return nil, err
+		}
+
+		sync.Stats = stats
+	}
+
 	return reader_v2.SyncsReaderServiceGetLatestFinishedSyncResponse_builder{
 		Sync: reader_v2.SyncRun_builder{
 			Id:           sync.ID,
@@ -1137,6 +1327,7 @@ func (c *C1File) GetLatestFinishedSync(
 			SyncToken:    sync.SyncToken,
 			SyncType:     string(sync.Type),
 			ParentSyncId: sync.ParentSyncID,
+			Stats:        sync.Stats,
 		}.Build(),
 	}.Build(), nil
 }

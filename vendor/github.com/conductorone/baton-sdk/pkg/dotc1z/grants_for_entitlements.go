@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"sort"
 	"strconv"
 	"time"
 
@@ -135,7 +134,7 @@ func (c *C1File) ListGrantsForEntitlements(
 	if limit < 0 {
 		limit = 0
 	}
-	q = q.Order(goqu.C("entitlement_id").Asc(), goqu.C("id").Asc()).Limit(uint(limit + 1))
+	q = q.Order(goqu.C("entitlement_id").Asc(), goqu.C("id").Asc()).Limit(uint(limit + 1)) // #nosec G115 -- limit is clamped to maxPageSize.
 
 	query, args, err := q.ToSQL()
 	if err != nil {
@@ -212,17 +211,16 @@ func findEntitlementIndex(ents []*v2.Entitlement, id string) int {
 	return -1
 }
 
-// entitlementListChecksum hashes the sorted entitlement ID set so
-// reorderings don't bust the cursor. Drop/add does.
+// entitlementListChecksum hashes the entitlement ID list IN REQUEST
+// ORDER. The cursor resumes positionally (ents[startIdx] provides the
+// resume entitlement id), so a reordered same-set list must restart the
+// scan — a sorted (order-insensitive) checksum would bless the stale
+// token while startIdx selected a different entitlement, silently
+// skipping and re-returning grants.
 func entitlementListChecksum(ents []*v2.Entitlement) uint32 {
-	ids := make([]string, 0, len(ents))
-	for _, e := range ents {
-		ids = append(ids, e.GetId())
-	}
-	sort.Strings(ids)
 	h := crc32.NewIEEE()
-	for _, id := range ids {
-		_, _ = h.Write([]byte(id))
+	for _, e := range ents {
+		_, _ = h.Write([]byte(e.GetId()))
 		_, _ = h.Write([]byte{0})
 	}
 	return h.Sum32()
@@ -234,7 +232,7 @@ func encodeBatchCursor(idx int, intra string, checksum uint32) string {
 	}
 	buf := make([]byte, 0, 16+len(intra))
 	var v [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(v[:], uint64(idx))
+	n := binary.PutUvarint(v[:], uint64(idx)) // #nosec G115 -- idx is normalized non-negative; int values fit in uint64.
 	buf = append(buf, v[:n]...)
 	intraBytes := []byte(intra)
 	n = binary.PutUvarint(v[:], uint64(len(intraBytes)))
@@ -264,7 +262,10 @@ func decodeBatchCursor(token string, currentChecksum uint32) (int, string, error
 		return 0, "", errors.New("ListGrantsForEntitlements: cursor missing intra length")
 	}
 	raw = raw[n:]
-	if uint64(len(raw)) < lenU+4 {
+	// Guard each term separately: lenU is attacker-controlled and lenU+4 can
+	// wrap around uint64, which would pass a combined comparison and panic on
+	// the slice below (mirrors engine/pebble/grants_for_entitlements.go).
+	if lenU > uint64(len(raw)) || uint64(len(raw))-lenU < 4 {
 		return 0, "", errors.New("ListGrantsForEntitlements: cursor truncated")
 	}
 	intra := string(raw[:lenU])

@@ -7,8 +7,10 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	v2 "github.com/conductorone/baton-sdk/pb/c1/connector/v2"
+	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
+	"github.com/conductorone/baton-sdk/pkg/types/sessions"
 	"github.com/conductorone/baton-sdk/pkg/uotel"
 )
 
@@ -16,20 +18,25 @@ import (
 // wrapper structs satisfy each sub-interface. These assertions catch
 // signature drift at build time rather than at the first runtime call.
 var (
-	_ C1ZStore   = (*C1File)(nil)
-	_ GrantStore = c1FileGrantStore{}
-	_ SyncMeta   = c1FileSyncMeta{}
-	_ FileOps    = c1FileFileOps{}
+	_ c1zstore.Store                             = (*C1File)(nil)
+	_ c1zstore.GrantStore                        = c1FileGrantStore{}
+	_ c1zstore.SyncMeta                          = c1FileSyncMeta{}
+	_ c1zstore.IngestInvariantVerificationWriter = c1FileSyncMeta{}
+	_ c1zstore.FileOps                           = c1FileFileOps{}
+	_ SessionStore                               = c1FileSessionStore{}
 )
 
 // Grants returns the grant-store slice of this c1z.
-func (c *C1File) Grants() GrantStore { return c1FileGrantStore{c} }
+func (c *C1File) Grants() c1zstore.GrantStore { return c1FileGrantStore{c} }
 
 // SyncMeta returns the sync-metadata slice of this c1z.
-func (c *C1File) SyncMeta() SyncMeta { return c1FileSyncMeta{c} }
+func (c *C1File) SyncMeta() c1zstore.SyncMeta { return c1FileSyncMeta{c} }
 
 // FileOps returns the file-operations slice of this c1z.
-func (c *C1File) FileOps() FileOps { return c1FileFileOps{c} }
+func (c *C1File) FileOps() c1zstore.FileOps { return c1FileFileOps{c} }
+
+// SessionStore returns the session-store slice of this c1z.
+func (c *C1File) SessionStore() sessions.SessionStore { return c1FileSessionStore{c} }
 
 // -----------------------------------------------------------------------------
 // GrantStore
@@ -92,7 +99,7 @@ func (c *C1File) StoreExpandedGrants(ctx context.Context, grants ...*v2.Grant) e
 // PendingExpansionPage implements GrantStore. Thin wrapper over
 // listExpandableGrantsInternal(Mode: ExpansionNeedsOnly) that reshapes
 // the internal row struct into the exported PendingExpansion shape.
-func (g c1FileGrantStore) PendingExpansionPage(ctx context.Context, pageToken string) ([]PendingExpansion, string, error) {
+func (g c1FileGrantStore) PendingExpansionPage(ctx context.Context, pageToken string) ([]c1zstore.PendingExpansion, string, error) {
 	defs, nextPageToken, err := g.c.listExpandableGrantsInternal(ctx, grantListOptions{
 		Mode:      grantListModeExpansionNeedsOnly,
 		PageToken: pageToken,
@@ -100,12 +107,12 @@ func (g c1FileGrantStore) PendingExpansionPage(ctx context.Context, pageToken st
 	if err != nil {
 		return nil, "", err
 	}
-	out := make([]PendingExpansion, 0, len(defs))
+	out := make([]c1zstore.PendingExpansion, 0, len(defs))
 	for _, def := range defs {
 		if def == nil {
 			continue
 		}
-		out = append(out, PendingExpansion{
+		out = append(out, c1zstore.PendingExpansion{
 			GrantExternalID:         def.GrantExternalID,
 			TargetEntitlementID:     def.TargetEntitlementID,
 			PrincipalResourceTypeID: def.PrincipalResourceTypeID,
@@ -131,17 +138,17 @@ func (g c1FileGrantStore) PendingExpansionPage(ctx context.Context, pageToken st
 // walks terminate promptly when the caller's deadline/cancel fires;
 // rows within a single page are still delivered (they are already in
 // memory), so cancellation responsiveness is page-grained, not row-grained.
-func (g c1FileGrantStore) PendingExpansion(ctx context.Context) iter.Seq2[PendingExpansion, error] {
-	return func(yield func(PendingExpansion, error) bool) {
+func (g c1FileGrantStore) PendingExpansion(ctx context.Context) iter.Seq2[c1zstore.PendingExpansion, error] {
+	return func(yield func(c1zstore.PendingExpansion, error) bool) {
 		pageToken := ""
 		for {
 			if err := ctx.Err(); err != nil {
-				_ = yield(PendingExpansion{}, err)
+				_ = yield(c1zstore.PendingExpansion{}, err)
 				return
 			}
 			page, nextPageToken, err := g.PendingExpansionPage(ctx, pageToken)
 			if err != nil {
-				_ = yield(PendingExpansion{}, err)
+				_ = yield(c1zstore.PendingExpansion{}, err)
 				return
 			}
 			for _, pe := range page {
@@ -167,7 +174,7 @@ func (g c1FileGrantStore) ListWithAnnotationsForResourcePage(
 	syncID string,
 	pageToken string,
 	pageSize uint32,
-) ([]GrantAnnotation, string, error) {
+) ([]c1zstore.GrantAnnotation, string, error) {
 	resp, err := g.c.listGrantsWithExpansionInternal(ctx, grantListOptions{
 		Mode:      grantListModePayloadWithExpansion,
 		Resource:  resource,
@@ -184,13 +191,13 @@ func (g c1FileGrantStore) ListWithAnnotationsForResourcePage(
 // grantAnnotationRowsFromInternal converts the internal row shape into
 // the exported GrantAnnotation shape, unifying the code path between
 // ListWithAnnotationsPage and ListWithAnnotationsForResourcePage.
-func grantAnnotationRowsFromInternal(rows []*internalGrantRow) []GrantAnnotation {
-	out := make([]GrantAnnotation, 0, len(rows))
+func grantAnnotationRowsFromInternal(rows []*internalGrantRow) []c1zstore.GrantAnnotation {
+	out := make([]c1zstore.GrantAnnotation, 0, len(rows))
 	for _, row := range rows {
 		if row == nil {
 			continue
 		}
-		ga := GrantAnnotation{
+		ga := c1zstore.GrantAnnotation{
 			Grant:                   row.Grant,
 			GrantExternalID:         row.Grant.GetId(),
 			TargetEntitlementID:     row.Grant.GetEntitlement().GetId(),
@@ -218,7 +225,7 @@ func grantAnnotationRowsFromInternal(rows []*internalGrantRow) []GrantAnnotation
 // from the underlying grant proto, regardless of whether the grant has
 // an expansion annotation, so callers don't need to branch on
 // Annotation-nil to get identity.
-func (g c1FileGrantStore) ListWithAnnotationsPage(ctx context.Context, pageToken string) ([]GrantAnnotation, string, error) {
+func (g c1FileGrantStore) ListWithAnnotationsPage(ctx context.Context, pageToken string) ([]c1zstore.GrantAnnotation, string, error) {
 	resp, err := g.c.listGrantsWithExpansionInternal(ctx, grantListOptions{
 		Mode:      grantListModePayloadWithExpansion,
 		PageToken: pageToken,
@@ -232,17 +239,17 @@ func (g c1FileGrantStore) ListWithAnnotationsPage(ctx context.Context, pageToken
 // ListWithAnnotations implements GrantStore. Convenience iterator that
 // walks every page via ListWithAnnotationsPage. Cancellation behavior is
 // identical to PendingExpansion (page-grained).
-func (g c1FileGrantStore) ListWithAnnotations(ctx context.Context) iter.Seq2[GrantAnnotation, error] {
-	return func(yield func(GrantAnnotation, error) bool) {
+func (g c1FileGrantStore) ListWithAnnotations(ctx context.Context) iter.Seq2[c1zstore.GrantAnnotation, error] {
+	return func(yield func(c1zstore.GrantAnnotation, error) bool) {
 		pageToken := ""
 		for {
 			if err := ctx.Err(); err != nil {
-				_ = yield(GrantAnnotation{}, err)
+				_ = yield(c1zstore.GrantAnnotation{}, err)
 				return
 			}
 			page, nextPageToken, err := g.ListWithAnnotationsPage(ctx, pageToken)
 			if err != nil {
-				_ = yield(GrantAnnotation{}, err)
+				_ = yield(c1zstore.GrantAnnotation{}, err)
 				return
 			}
 			for _, ga := range page {
@@ -269,9 +276,21 @@ func (s c1FileSyncMeta) MarkSyncSupportsDiff(ctx context.Context, syncID string)
 	return s.c.SetSupportsDiff(ctx, syncID)
 }
 
+func (s c1FileSyncMeta) MarkIngestInvariantsVerified(
+	ctx context.Context,
+	syncID string,
+	verification c1zstore.IngestInvariantVerification,
+) error {
+	return s.c.markIngestInvariantsVerified(ctx, syncID, verification)
+}
+
+func (s c1FileSyncMeta) ClearIngestInvariantVerification(ctx context.Context, syncID string) error {
+	return s.c.clearIngestInvariantVerification(ctx, syncID)
+}
+
 // LatestFullSync implements SyncMeta. Returns the most-recent finished
 // SyncTypeFull run, or nil if none.
-func (s c1FileSyncMeta) LatestFullSync(ctx context.Context) (*SyncRun, error) {
+func (s c1FileSyncMeta) LatestFullSync(ctx context.Context) (*c1zstore.SyncRun, error) {
 	run, err := s.c.getFinishedSync(ctx, 0, connectorstore.SyncTypeFull)
 	if err != nil {
 		return nil, err
@@ -280,8 +299,8 @@ func (s c1FileSyncMeta) LatestFullSync(ctx context.Context) (*SyncRun, error) {
 }
 
 // LatestFinishedSyncOfAnyType implements SyncMeta. Returns the most-recent
-// finished sync of any type (including diff types), or nil if none.
-func (s c1FileSyncMeta) LatestFinishedSyncOfAnyType(ctx context.Context) (*SyncRun, error) {
+// finished sync of any type, or nil if none.
+func (s c1FileSyncMeta) LatestFinishedSyncOfAnyType(ctx context.Context) (*c1zstore.SyncRun, error) {
 	run, err := s.c.getFinishedSync(ctx, 0, connectorstore.SyncTypeAny)
 	if err != nil {
 		return nil, err
@@ -294,6 +313,17 @@ func (s c1FileSyncMeta) Stats(ctx context.Context, syncType connectorstore.SyncT
 	return s.c.Stats(ctx, syncType, syncID)
 }
 
+// StatsV2 implements SyncMeta. Signature matches *C1File.StatsV2 exactly.
+func (s c1FileSyncMeta) StatsV2(ctx context.Context, syncType connectorstore.SyncType, syncID string) (*reader_v2.SyncStats, error) {
+	return s.c.StatsV2(ctx, syncType, syncID)
+}
+
+// RecalculateStats implements SyncMeta. Thin passthrough to
+// *C1File.RecalculateStats.
+func (s c1FileSyncMeta) RecalculateStats(ctx context.Context, syncID string) error {
+	return s.c.RecalculateStats(ctx, syncID)
+}
+
 // -----------------------------------------------------------------------------
 // FileOps
 // -----------------------------------------------------------------------------
@@ -303,7 +333,7 @@ type c1FileFileOps struct{ c *C1File }
 // CloneSync implements FileOps. Translates the engine-neutral
 // CloneSyncOptions into the SQLite-specific C1FOptions applied to the
 // destination file.
-func (f c1FileFileOps) CloneSync(ctx context.Context, outPath string, syncID string, opts ...CloneSyncOption) error {
+func (f c1FileFileOps) CloneSync(ctx context.Context, outPath string, syncID string, opts ...c1zstore.CloneSyncOption) error {
 	cloneOpts := c1zstore.NewCloneSyncOptions(opts...)
 	var c1fOpts []C1FOption
 	if cloneOpts.TmpDir != "" {
@@ -312,7 +342,44 @@ func (f c1FileFileOps) CloneSync(ctx context.Context, outPath string, syncID str
 	return f.c.CloneSync(ctx, outPath, syncID, c1fOpts...)
 }
 
-// GenerateSyncDiff implements FileOps. Direct passthrough.
-func (f c1FileFileOps) GenerateSyncDiff(ctx context.Context, baseSyncID, appliedSyncID string) (string, error) {
-	return f.c.GenerateSyncDiff(ctx, baseSyncID, appliedSyncID)
+// CopyIsolateSync implements FileOps. Translates the engine-neutral
+// CloneSyncOptions into the SQLite-specific C1FOptions applied to the
+// destination file.
+func (f c1FileFileOps) CopyIsolateSync(ctx context.Context, outPath string, syncID string, opts ...c1zstore.CloneSyncOption) error {
+	cloneOpts := c1zstore.NewCloneSyncOptions(opts...)
+	var c1fOpts []C1FOption
+	if cloneOpts.TmpDir != "" {
+		c1fOpts = append(c1fOpts, WithC1FTmpDir(cloneOpts.TmpDir))
+	}
+	return f.c.CopyIsolateSync(ctx, outPath, syncID, c1fOpts...)
+}
+
+type c1FileSessionStore struct{ c *C1File }
+
+func (s c1FileSessionStore) Get(ctx context.Context, key string, opt ...sessions.SessionStoreOption) ([]byte, bool, error) {
+	return s.c.SessionGet(ctx, key, opt...)
+}
+
+func (s c1FileSessionStore) Set(ctx context.Context, key string, value []byte, opt ...sessions.SessionStoreOption) error {
+	return s.c.SessionSet(ctx, key, value, opt...)
+}
+
+func (s c1FileSessionStore) GetMany(ctx context.Context, keys []string, opt ...sessions.SessionStoreOption) (map[string][]byte, []string, error) {
+	return s.c.SessionGetMany(ctx, keys, opt...)
+}
+
+func (s c1FileSessionStore) GetAll(ctx context.Context, pageToken string, opt ...sessions.SessionStoreOption) (map[string][]byte, string, error) {
+	return s.c.SessionGetAll(ctx, pageToken, opt...)
+}
+
+func (s c1FileSessionStore) SetMany(ctx context.Context, values map[string][]byte, opt ...sessions.SessionStoreOption) error {
+	return s.c.SessionSetMany(ctx, values, opt...)
+}
+
+func (s c1FileSessionStore) Delete(ctx context.Context, key string, opt ...sessions.SessionStoreOption) error {
+	return s.c.SessionDelete(ctx, key, opt...)
+}
+
+func (s c1FileSessionStore) Clear(ctx context.Context, opt ...sessions.SessionStoreOption) error {
+	return s.c.SessionClear(ctx, opt...)
 }

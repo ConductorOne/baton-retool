@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/cockroachdb/pebble/v2"
 
 	v3 "github.com/conductorone/baton-sdk/pb/c1/storage/v3"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/engine/pebble/internal/rawdb"
 )
 
 // PutResourceRecord writes a resource record + its by_parent index
@@ -20,11 +22,12 @@ func (e *Engine) PutResourceRecord(ctx context.Context, r *v3.ResourceRecord) er
 	return e.PutResourceRecords(ctx, r)
 }
 
-// PutResourceRecords writes N resources in two pebble.Batches —
-// primary keys in one, by_parent index keys in the other. Mirrors
+// PutResourceRecords writes N resources through a single RecordBatch —
+// StageResourcePut derives the by_parent index obligations inside
+// rawdb, so primary and index land in one atomic commit. Mirrors
 // the PutGrantRecords pattern (RFC §3a Tier-B/C):
-//   - within-call dedup pre-pass keyed by (sync, rt, res_id) drops
-//     earlier occurrences of repeated resources;
+//   - within-call dedup pre-pass keyed by (rt, res_id) drops earlier
+//     occurrences of repeated resources;
 //   - the first PutResourceRecords call of a fresh sync skips the
 //     read-before-write Get (keyspace provably empty);
 //   - subsequent calls fall back to read-before-write so cross-call
@@ -34,107 +37,91 @@ func (e *Engine) PutResourceRecords(ctx context.Context, records ...*v3.Resource
 		return nil
 	}
 	return e.withWrite(func() error {
-		priBatch := e.db.NewBatch()
-		defer priBatch.Close()
-		idxBatch := e.db.NewBatch()
-		defer idxBatch.Close()
-
-		fresh := e.IsFreshSync()
-		skipGet := e.takeFreshResourcesEmpty()
-
-		type dedupKey struct {
-			syncID, rtID, resID string
+		if err := e.requireCurrentSync(); err != nil {
+			return err
 		}
-		var dedup map[dedupKey]int
-		if len(records) > 1 {
-			dedup = make(map[dedupKey]int, len(records))
-			for i, r := range records {
-				if r == nil {
-					continue
-				}
-				dedup[dedupKey{r.GetSyncId(), r.GetResourceTypeId(), r.GetResourceId()}] = i
-			}
-		}
+		batch := e.db.NewRecordBatch()
+		defer batch.Close()
 
-		var (
-			lastSyncIDStr string
-			lastIDBytes   []byte
-			haveLast      bool
-		)
+		if _, err := e.stageResourceRecords(batch, records); err != nil {
+			return err
+		}
+		opts := recordWriteOpts
+		// One atomic commit: rows and their index obligations ride the
+		// same batch, so a primary commit landing without its index
+		// entries is unexpressible.
+		return batch.Commit(opts)
+	})
+}
+
+// Caller holds the write barrier and commits the batch.
+func (e *Engine) stageResourceRecords(batch *rawdb.RecordBatch, records []*v3.ResourceRecord) (uint64, error) {
+	if len(records) == 0 {
+		return 0, nil
+	}
+	skipGet := e.takeFreshResourcesEmpty()
+
+	type dedupKey struct {
+		rtID, resID string
+	}
+	var dedup map[dedupKey]int
+	if len(records) > 1 {
+		dedup = make(map[dedupKey]int, len(records))
 		for i, r := range records {
 			if r == nil {
 				continue
 			}
-			if dedup != nil {
-				if dedup[dedupKey{r.GetSyncId(), r.GetResourceTypeId(), r.GetResourceId()}] != i {
-					continue
-				}
-			}
-			var (
-				idBytes []byte
-				err     error
-			)
-			if sid := r.GetSyncId(); haveLast && sid == lastSyncIDStr {
-				idBytes = lastIDBytes
-			} else {
-				idBytes, err = e.resolveSyncBytes(sid)
-				if err != nil {
-					return err
-				}
-				lastSyncIDStr = sid
-				lastIDBytes = idBytes
-				haveLast = true
-			}
-			key := encodeResourceKey(idBytes, r.GetResourceTypeId(), r.GetResourceId())
-			val, err := marshalRecord(r)
-			if err != nil {
-				return err
-			}
-			if !skipGet {
-				oldVal, closer, getErr := e.db.Get(key)
-				switch {
-				case getErr == nil:
-					old := &v3.ResourceRecord{}
-					if err := unmarshalRecord(oldVal, old); err != nil {
-						closer.Close()
-						return fmt.Errorf("PutResourceRecords: unmarshal old %s/%s: %w",
-							r.GetResourceTypeId(), r.GetResourceId(), err)
-					}
-					if err := e.deleteResourceIndexes(idxBatch, idBytes, old); err != nil {
-						closer.Close()
-						return err
-					}
-					closer.Close()
-				case errors.Is(getErr, pebble.ErrNotFound):
-					// no prior — write unconditionally
-				default:
-					return fmt.Errorf("PutResourceRecords: get old: %w", getErr)
-				}
-			}
-			if err := priBatch.Set(key, val, nil); err != nil {
-				return err
-			}
-			if err := e.writeResourceIndexes(idxBatch, idBytes, r); err != nil {
-				return err
+			dedup[dedupKey{r.GetResourceTypeId(), r.GetResourceId()}] = i
+		}
+	}
+
+	var staged uint64
+	for i, r := range records {
+		if r == nil {
+			continue
+		}
+		if dedup != nil {
+			if dedup[dedupKey{r.GetResourceTypeId(), r.GetResourceId()}] != i {
+				continue
 			}
 		}
-		opts := writeOpts(e.opts.durability)
-		if fresh {
-			opts = pebble.NoSync
+		staged++
+		key := encodeResourceKey(r.GetResourceTypeId(), r.GetResourceId())
+		val, err := marshalRecord(r)
+		if err != nil {
+			return 0, err
 		}
-		if err := priBatch.Commit(opts); err != nil {
-			return err
+		var oldVal []byte
+		var oldCloser io.Closer
+		if !skipGet {
+			got, closer, getErr := e.db.Get(key)
+			switch {
+			case getErr == nil:
+				// The prior VALUE is genuinely needed here (unlike
+				// grants): the by_parent cleanup key depends on the old
+				// parent ref, which only the old bytes carry.
+				oldVal, oldCloser = got, closer
+			case errors.Is(getErr, pebble.ErrNotFound):
+				// no prior — write unconditionally
+			default:
+				return 0, fmt.Errorf("PutResourceRecords: get old: %w", getErr)
+			}
 		}
-		return idxBatch.Commit(opts)
-	})
+		// One typed op stages the row and its by_parent obligations
+		// (old entry cleanup from oldVal, new entry from val).
+		err = batch.StageResourcePut(key, val, oldVal, r.GetResourceTypeId(), r.GetResourceId())
+		if oldCloser != nil {
+			_ = oldCloser.Close()
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	return staged, nil
 }
 
-func (e *Engine) GetResourceRecord(ctx context.Context, syncID, resourceTypeID, resourceID string) (*v3.ResourceRecord, error) {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return nil, err
-	}
-	key := encodeResourceKey(idBytes, resourceTypeID, resourceID)
+func (e *Engine) GetResourceRecord(ctx context.Context, resourceTypeID, resourceID string) (*v3.ResourceRecord, error) {
+	key := encodeResourceKey(resourceTypeID, resourceID)
 	val, closer, err := e.db.Get(key)
 	if err != nil {
 		return nil, err
@@ -147,15 +134,11 @@ func (e *Engine) GetResourceRecord(ctx context.Context, syncID, resourceTypeID, 
 	return r, nil
 }
 
-func (e *Engine) DeleteResourceRecord(ctx context.Context, syncID, resourceTypeID, resourceID string) error {
+func (e *Engine) DeleteResourceRecord(ctx context.Context, resourceTypeID, resourceID string) error {
 	return e.withWrite(func() error {
-		idBytes, err := e.resolveSyncBytes(syncID)
-		if err != nil {
-			return err
-		}
-		key := encodeResourceKey(idBytes, resourceTypeID, resourceID)
+		key := encodeResourceKey(resourceTypeID, resourceID)
 
-		batch := e.db.NewBatch()
+		batch := e.db.NewRecordBatch()
 		defer batch.Close()
 
 		oldVal, closer, err := e.db.Get(key)
@@ -165,55 +148,19 @@ func (e *Engine) DeleteResourceRecord(ctx context.Context, syncID, resourceTypeI
 			}
 			return err
 		}
-		old := &v3.ResourceRecord{}
-		if err := unmarshalRecord(oldVal, old); err != nil {
-			closer.Close()
-			return fmt.Errorf("DeleteResourceRecord: unmarshal old %s/%s: %w", resourceTypeID, resourceID, err)
-		}
-		if err := e.deleteResourceIndexes(batch, idBytes, old); err != nil {
-			closer.Close()
-			return err
-		}
+		// The typed op stages the row's removal plus its by_parent
+		// cleanup derived from the prior value.
+		stageErr := batch.StageResourceDelete(key, oldVal, resourceTypeID, resourceID)
 		closer.Close()
-		if err := batch.Delete(key, nil); err != nil {
-			return err
+		if stageErr != nil {
+			return stageErr
 		}
 		return batch.Commit(writeOpts(e.opts.durability))
 	})
 }
 
-func (e *Engine) writeResourceIndexes(batch *pebble.Batch, syncIDBytes []byte, r *v3.ResourceRecord) error {
-	parent := r.GetParent()
-	if parent == nil || parent.GetResourceId() == "" {
-		return nil
-	}
-	k := encodeResourceByParentIndexKey(
-		syncIDBytes,
-		parent.GetResourceTypeId(), parent.GetResourceId(),
-		r.GetResourceTypeId(), r.GetResourceId(),
-	)
-	return batch.Set(k, nil, nil)
-}
-
-func (e *Engine) deleteResourceIndexes(batch *pebble.Batch, syncIDBytes []byte, r *v3.ResourceRecord) error {
-	parent := r.GetParent()
-	if parent == nil || parent.GetResourceId() == "" {
-		return nil
-	}
-	k := encodeResourceByParentIndexKey(
-		syncIDBytes,
-		parent.GetResourceTypeId(), parent.GetResourceId(),
-		r.GetResourceTypeId(), r.GetResourceId(),
-	)
-	return batch.Delete(k, nil)
-}
-
-func (e *Engine) IterateResourcesBySync(ctx context.Context, syncID string, yield func(*v3.ResourceRecord) bool) error {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return err
-	}
-	prefix := encodeResourcePrefix(idBytes)
+func (e *Engine) IterateResources(ctx context.Context, yield func(*v3.ResourceRecord) bool) error {
+	prefix := encodeResourcePrefix()
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: upperBoundOf(prefix),
@@ -234,12 +181,8 @@ func (e *Engine) IterateResourcesBySync(ctx context.Context, syncID string, yiel
 	return iter.Error()
 }
 
-func (e *Engine) IterateResourcesByParent(ctx context.Context, syncID, parentRT, parentID string, yield func(*v3.ResourceRecord) bool) error {
-	idBytes, err := e.resolveSyncBytes(syncID)
-	if err != nil {
-		return err
-	}
-	indexPrefix := encodeResourceByParentPrefix(idBytes, parentRT, parentID)
+func (e *Engine) IterateResourcesByParent(ctx context.Context, parentRT, parentID string, yield func(*v3.ResourceRecord) bool) error {
+	indexPrefix := encodeResourceByParentPrefix(parentRT, parentID)
 	iter, err := e.db.NewIter(&pebble.IterOptions{
 		LowerBound: indexPrefix,
 		UpperBound: upperBoundOf(indexPrefix),
@@ -254,7 +197,7 @@ func (e *Engine) IterateResourcesByParent(ctx context.Context, syncID, parentRT,
 		if !ok {
 			continue
 		}
-		val, closer, err := e.db.Get(encodeResourceKey(idBytes, childRT, childID))
+		val, closer, err := e.db.Get(encodeResourceKey(childRT, childID))
 		if err != nil {
 			if errors.Is(err, pebble.ErrNotFound) {
 				continue

@@ -3,10 +3,12 @@ package attached
 import (
 	"context"
 	"fmt"
+	"time"
 
 	reader_v2 "github.com/conductorone/baton-sdk/pb/c1/reader/v2"
 	"github.com/conductorone/baton-sdk/pkg/connectorstore"
 	"github.com/conductorone/baton-sdk/pkg/dotc1z"
+	"github.com/conductorone/baton-sdk/pkg/dotc1z/c1zstore"
 	"github.com/grpc-ecosystem/go-grpc-middleware/logging/zap/ctxzap"
 	"go.uber.org/zap"
 )
@@ -24,7 +26,7 @@ type Compactor struct {
 // Both arguments are C1ZStore; the constructor type-asserts to *dotc1z.C1File
 // and returns an error on mismatch. This keeps the public entry point clean
 // while confining the SQLite-specific concern to the attached package.
-func NewAttachedCompactor(base, applied dotc1z.C1ZStore) (*Compactor, error) {
+func NewAttachedCompactor(base, applied c1zstore.Store) (*Compactor, error) {
 	baseFile, ok := dotc1z.AsSQLiteStore(base)
 	if !ok {
 		return nil, fmt.Errorf("attached compactor requires SQLite-backed base store, got %T", base)
@@ -40,7 +42,6 @@ func NewAttachedCompactor(base, applied dotc1z.C1ZStore) (*Compactor, error) {
 }
 
 func latestFinishedCompactableSync(ctx context.Context, f *dotc1z.C1File) (*reader_v2.SyncRun, error) {
-	// Compaction must NOT operate on diff syncs (partial_upserts / partial_deletions).
 	// We want the latest finished "snapshot-like" sync.
 	candidates := []connectorstore.SyncType{
 		connectorstore.SyncTypeFull,
@@ -61,7 +62,12 @@ func latestFinishedCompactableSync(ctx context.Context, f *dotc1z.C1File) (*read
 			continue
 		}
 
-		if best == nil || s.GetEndedAt().AsTime().After(best.GetEndedAt().AsTime()) {
+		sEndedAt := s.GetEndedAt().AsTime()
+		bestEndedAt := time.Time{}
+		if best != nil {
+			bestEndedAt = best.GetEndedAt().AsTime()
+		}
+		if best == nil || sEndedAt.After(bestEndedAt) || (sEndedAt.Equal(bestEndedAt) && s.GetId() > best.GetId()) {
 			best = s
 		}
 	}
@@ -75,11 +81,7 @@ func (c *Compactor) Compact(ctx context.Context) error {
 		return fmt.Errorf("failed to get base sync: %w", err)
 	}
 	if baseSync == nil {
-		return fmt.Errorf(
-			"no finished compactable sync found in base (diff sync types %q/%q are not compactable)",
-			string(connectorstore.SyncTypePartialUpserts),
-			string(connectorstore.SyncTypePartialDeletions),
-		)
+		return fmt.Errorf("no finished compactable sync found in base")
 	}
 
 	appliedSync, err := latestFinishedCompactableSync(ctx, c.applied)
@@ -87,11 +89,7 @@ func (c *Compactor) Compact(ctx context.Context) error {
 		return fmt.Errorf("failed to get applied sync: %w", err)
 	}
 	if appliedSync == nil {
-		return fmt.Errorf(
-			"no finished compactable sync found in applied (diff sync types %q/%q are not compactable)",
-			string(connectorstore.SyncTypePartialUpserts),
-			string(connectorstore.SyncTypePartialDeletions),
-		)
+		return fmt.Errorf("no finished compactable sync found in applied")
 	}
 
 	l := ctxzap.Extract(ctx)
