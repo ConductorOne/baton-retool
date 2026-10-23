@@ -19,7 +19,7 @@ jobs:
           skip-cache: true
           # Pinned so lint findings don't drift with new golangci-lint releases.
           # Bump deliberately, fixing any new findings in the same PR.
-          version: v2.13.2
+          version: v2.15.0
           args: --timeout=3m
   go-test:
     runs-on: ubuntu-latest
