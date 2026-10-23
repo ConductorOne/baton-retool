@@ -331,7 +331,7 @@ func (s *pageSyncer) Revoke(ctx context.Context, grant *v2.Grant) (annotations.A
 			return nil, err
 		}
 
-		groupName := fmt.Sprintf("%d%d-group-%s-%s", page.OrganizationID, page.ID, page.Name, permission)
+		groupName := fmt.Sprintf("%d%d-group-%s-%s", page.GetOrgID(), page.ID, page.Name, permission)
 
 		group, err := s.client.GetGroupByName(ctx, page.OrganizationID, groupName)
 		if err != nil {
@@ -404,7 +404,7 @@ func findPageGroupPermission(ctx context.Context, client *client.Client, pageId 
 		return err
 	}
 
-	groupName := fmt.Sprintf("%d%d-group-%s-%s", page.OrganizationID, page.ID, page.Name, permission)
+	groupName := fmt.Sprintf("%d%d-group-%s-%s", page.GetOrgID(), page.ID, page.Name, permission)
 
 	group, err := client.GetGroupByName(ctx, page.OrganizationID, groupName)
 	if err != nil {

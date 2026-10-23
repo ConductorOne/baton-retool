@@ -54,40 +54,34 @@ func (s *userSyncer) List(
 
 	var ret []*v2.Resource
 	for _, o := range users {
-		var annos annotations.Annotations
-
-		var utStatus v2.UserTrait_Status_Status
-		if o.Enabled {
-			utStatus = v2.UserTrait_Status_STATUS_ENABLED
-		} else {
-			utStatus = v2.UserTrait_Status_STATUS_DISABLED
+		userStatus := v2.Status_RESOURCE_STATUS_ENABLED
+		if !o.Enabled {
+			userStatus = v2.Status_RESOURCE_STATUS_DISABLED
 		}
 
 		resourceID := formatObjectID(resourceTypeUser.Id, o.ID)
-		ut, err := resources.NewUserTrait(resources.WithEmail(o.Email, true), resources.WithStatus(utStatus), resources.WithUserProfile(map[string]interface{}{
-			"email":           o.Email,
-			"first_name":      o.GetFirstName(),
-			"last_name":       o.GetLastName(),
-			"user_id":         fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
-			"last_logged_in":  o.GetLastLoggedIn().Format("2006-01-02 15:04:05.999999999 -0700 MST"),
-			"organization_id": o.OrganizationID,
-			"user_name":       o.GetUserName(),
-		}))
+		resource, err := resources.NewUserResource(
+			fmt.Sprintf("%s %s", o.GetFirstName(), o.GetLastName()),
+			s.resourceType,
+			resourceID,
+			[]resources.UserTraitOption{resources.WithEmail(o.Email, true)},
+			resources.WithParentResourceID(parentResourceID),
+			resources.WithResourceStatus(userStatus, ""),
+			resources.WithResourceProfile(map[string]interface{}{
+				"email":           o.Email,
+				"first_name":      o.GetFirstName(),
+				"last_name":       o.GetLastName(),
+				"user_id":         fmt.Sprintf("%s:%s", parentResourceID.Resource, resourceID),
+				"last_logged_in":  o.GetLastLoggedIn().Format("2006-01-02 15:04:05.999999999 -0700 MST"),
+				"organization_id": o.OrganizationID,
+				"user_name":       o.GetUserName(),
+			}),
+		)
 		if err != nil {
 			return nil, "", nil, err
 		}
 
-		annos.Append(ut)
-
-		ret = append(ret, &v2.Resource{
-			DisplayName: fmt.Sprintf("%s %s", o.GetFirstName(), o.GetLastName()),
-			Id: &v2.ResourceId{
-				ResourceType: s.resourceType.Id,
-				Resource:     resourceID,
-			},
-			ParentResourceId: parentResourceID,
-			Annotations:      annos,
-		})
+		ret = append(ret, resource)
 	}
 
 	return ret, nextPageToken, nil, nil
@@ -169,36 +163,24 @@ func (s *userSyncer) CreateAccount(
 // restUserResource builds a user resource from a REST user, keyed by its Postgres
 // legacy_id so it matches what a full sync produces (user:<int64>).
 func (s *userSyncer) restUserResource(u *client.RESTUser) (*v2.Resource, error) {
-	utStatus := v2.UserTrait_Status_STATUS_ENABLED
+	userStatus := v2.Status_RESOURCE_STATUS_ENABLED
 	if !u.Active {
-		utStatus = v2.UserTrait_Status_STATUS_DISABLED
+		userStatus = v2.Status_RESOURCE_STATUS_DISABLED
 	}
 
-	ut, err := resources.NewUserTrait(
-		resources.WithEmail(u.Email, true),
-		resources.WithStatus(utStatus),
-		resources.WithUserProfile(map[string]interface{}{
+	return resources.NewUserResource(
+		fmt.Sprintf("%s %s", u.FirstName, u.LastName),
+		resourceTypeUser,
+		formatObjectID(resourceTypeUser.Id, u.LegacyID),
+		[]resources.UserTraitOption{resources.WithEmail(u.Email, true)},
+		resources.WithResourceStatus(userStatus, ""),
+		resources.WithResourceProfile(map[string]interface{}{
 			"email":      u.Email,
 			"first_name": u.FirstName,
 			"last_name":  u.LastName,
 			"user_type":  u.UserType,
 		}),
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	var annos annotations.Annotations
-	annos.Append(ut)
-
-	return &v2.Resource{
-		DisplayName: fmt.Sprintf("%s %s", u.FirstName, u.LastName),
-		Id: &v2.ResourceId{
-			ResourceType: resourceTypeUser.Id,
-			Resource:     formatObjectID(resourceTypeUser.Id, u.LegacyID),
-		},
-		Annotations: annos,
-	}, nil
 }
 
 func newUserSyncer(ctx context.Context, c *client.Client, skipDisabledUsers bool) *userSyncer {

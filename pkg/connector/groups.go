@@ -69,7 +69,8 @@ func (s *groupSyncer) List(
 		}
 
 		options := []rs.ResourceOption{
-			rs.WithGroupTrait(rs.WithGroupProfile(p)),
+			rs.WithResourceProfile(p),
+			rs.WithGroupTrait(),
 			rs.WithParentResourceID(parentResourceID),
 		}
 
