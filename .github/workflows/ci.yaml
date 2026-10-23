@@ -1,5 +1,9 @@
 name: ci
-on: pull_request
+on:
+  pull_request:
+  push:
+    branches:
+      - main
 
 # A new push to the PR supersedes any in-flight run (the integration job is heavy).
 concurrency:
@@ -20,9 +24,8 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           skip-cache: true
-          # Pinned so lint findings don't drift with new golangci-lint releases.
-          # Bump deliberately, fixing any new findings in the same PR.
-          version: v2.15.0
+          # Same version as the shared verify workflow (ConductorOne/github-workflows).
+          version: v2.14.0
           args: --timeout=3m
   go-test:
     runs-on: ubuntu-latest
