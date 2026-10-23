@@ -24,7 +24,6 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           skip-cache: true
-          # Same version as the shared verify workflow (ConductorOne/github-workflows).
           version: v2.14.0
           args: --timeout=3m
   go-test:
